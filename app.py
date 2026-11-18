@@ -11,6 +11,14 @@ import pandas as pd
 from fitparse import FitFile
 import streamlit as st
 from aggregate_runs import build_activity_database, init_db, ingest_fit_bytes
+from cloud_vault import (
+    check_password_gate,
+    ensure_local_vault,
+    is_cloud_configured,
+    pull_fit_gz_from_cloud,
+    pull_vault_from_cloud,
+    push_vault_to_cloud,
+)
 from hr_analytics import (
     calculate_karvonen_zones,
     compute_banister_trimp,
@@ -24,14 +32,6 @@ from hr_analytics import (
     update_athlete_baselines,
 )
 from route_heatmap import render_heatmap_tab
-from cloud_vault import (
-    check_password_gate,
-    ensure_local_vault,
-    is_cloud_configured,
-    pull_vault_from_cloud,
-    push_vault_to_cloud,
-)
-
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -141,7 +141,6 @@ DB_NAME = 'training_vault.db'
 check_password_gate()
 ensure_local_vault(DB_NAME)
 init_db(DB_NAME)
-
 
 ZONE_PALETTE = {
     'Zone 1 (Recovery)': '#9ca3af',   # Grey (Zone 0/1)
@@ -425,6 +424,7 @@ if uploaded_files:
     st.sidebar.success(f'Added {newly_added} run(s) to persistent vault.')
   if skipped_sport > 0:
     st.sidebar.info(f'Skipped {skipped_sport} non-running activity file(s).')
+
 active_hr_max, active_hr_rest, peak_src, last_upd = get_athlete_baselines(
     DB_NAME
 )
@@ -459,7 +459,6 @@ with st.sidebar.expander('Dynamic Athlete Baselines', expanded=False):
       push_vault_to_cloud(DB_NAME)
     st.success('Vault synced.')
     st.rerun()
-
 
 active_zones = calculate_karvonen_zones(active_hr_max, active_hr_rest)
 
@@ -777,11 +776,26 @@ else:
       ).fetchone()
       conn.close()
 
-      raw_bytes = gzip.decompress(gz_row[0])
+      gz_bytes = (
+          gz_row[0]
+          if (gz_row and gz_row[0])
+          else pull_fit_gz_from_cloud(selected_fname)
+      )
+      if not gz_bytes:
+        st.error(
+            f'Could not retrieve raw stream for `{selected_fname}` from cloud'
+            ' storage.'
+        )
+        st.stop()
+
+      raw_bytes = gzip.decompress(gz_bytes)
       data = parse_fit_bytes_raw(raw_bytes)
 
       session_dist_m = None
-      if not data['session'].empty and 'total_distance' in data['session'].columns:
+      if (
+          not data['session'].empty
+          and 'total_distance' in data['session'].columns
+      ):
         session_dist_m = data['session']['total_distance'].dropna().iloc[-1]
 
       if (
@@ -793,7 +807,9 @@ else:
         if pd.notna(raw_max_m) and raw_max_m > 0:
           cal_ratio = session_dist_m / raw_max_m
           if abs(cal_ratio - 1.0) > 0.005:
-            data['records']['distance'] = data['records']['distance'] * cal_ratio
+            data['records']['distance'] = (
+                data['records']['distance'] * cal_ratio
+            )
             if 'enhanced_speed' in data['records'].columns:
               data['records']['enhanced_speed'] = (
                   data['records']['enhanced_speed'] * cal_ratio
@@ -804,14 +820,14 @@ else:
       df_best_efforts = calculate_best_efforts(df_records)
 
       total_dist_mi = (
-      session_dist_m / 1609.34
-      if session_dist_m
-      else (
-          df_records['distance'].max() / 1609.34
-          if not df_records.empty and 'distance' in df_records.columns
-          else 0.0
+          session_dist_m / 1609.34
+          if session_dist_m
+          else (
+              df_records['distance'].max() / 1609.34
+              if not df_records.empty and 'distance' in df_records.columns
+              else 0.0
+          )
       )
-  )
       total_time_sec = df_records['dt'].sum() if not df_records.empty else 0.0
 
       avg_hr_run = (

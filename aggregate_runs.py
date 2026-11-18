@@ -6,6 +6,7 @@ import sqlite3
 import numpy as np
 import pandas as pd
 from fitparse import FitFile
+from cloud_vault import is_cloud_configured, push_fit_gz_to_cloud
 from hr_analytics import (
     calculate_karvonen_zones,
     compute_banister_trimp,
@@ -158,7 +159,7 @@ def compute_telemetry_metrics(df_records, dist_mi, total_time_sec, zones):
 def ingest_fit_bytes(
     file_name, raw_bytes, db_path=DB_NAME, downsample_step=3
 ):
-  """Parses raw .fit bytes and saves summary, PRs, GPS points, and compressed binary to SQLite."""
+  """Parses raw .fit bytes and saves summary, PRs, GPS points, and compressed binary."""
   init_db(db_path)
   fitfile = FitFile(io.BytesIO(raw_bytes))
 
@@ -173,6 +174,7 @@ def ingest_fit_bytes(
   ]
   df_records = pd.DataFrame(records)
 
+  # 1. Skip non-running activities (e.g., swimming, cycling, strength)
   sport = str(session_data.get('sport', 'running')).lower()
   if sport != 'running':
     return None
@@ -198,13 +200,6 @@ def ingest_fit_bytes(
         df_records['distance'] = df_records['distance'] * cal_ratio
         if 'enhanced_speed' in df_records.columns:
           df_records['enhanced_speed'] = df_records['enhanced_speed'] * cal_ratio
-
-  if (
-      total_dist_m is None
-      and not df_records.empty
-      and 'distance' in df_records.columns
-  ):
-    total_dist_m = df_records['distance'].max()
 
   total_time_sec = session_data.get('total_timer_time')
   if (
@@ -303,6 +298,8 @@ def ingest_fit_bytes(
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(file_name) DO UPDATE SET
+          distance_miles = excluded.distance_miles,
+          avg_pace = excluded.avg_pace,
           max_heart_rate = excluded.max_heart_rate,
           relative_effort_trimp = excluded.relative_effort_trimp,
           efficiency_factor = excluded.efficiency_factor,
@@ -334,15 +331,21 @@ def ingest_fit_bytes(
       ),
   )
 
-  # 2. Store compressed .fit binary for on-demand Single Activity inspection
+  # 2. Offload compressed .fit binary to Supabase object storage when configured
   compressed_blob = gzip.compress(raw_bytes)
+  if is_cloud_configured():
+    push_fit_gz_to_cloud(file_name, compressed_blob)
+    stored_blob = None
+  else:
+    stored_blob = sqlite3.Binary(compressed_blob)
+
   cursor.execute(
       '''
       INSERT INTO fit_files (file_name, raw_gz)
       VALUES (?, ?)
       ON CONFLICT(file_name) DO UPDATE SET raw_gz = excluded.raw_gz
       ''',
-      (file_name, sqlite3.Binary(compressed_blob)),
+      (file_name, stored_blob),
   )
 
   # 3. Cache downsampled GPS coordinates if not already present
