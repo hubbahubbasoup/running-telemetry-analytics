@@ -173,7 +173,32 @@ def ingest_fit_bytes(
   ]
   df_records = pd.DataFrame(records)
 
+  sport = str(session_data.get('sport', 'running')).lower()
+  if sport != 'running':
+    return None
+
   total_dist_m = session_data.get('total_distance')
+  if (
+      total_dist_m is None
+      and not df_records.empty
+      and 'distance' in df_records.columns
+  ):
+    total_dist_m = df_records['distance'].max()
+
+  # 2. If a treadmill run was manually calibrated, scale the record stream to match
+  if (
+      total_dist_m
+      and not df_records.empty
+      and 'distance' in df_records.columns
+  ):
+    raw_max_dist = df_records['distance'].max()
+    if pd.notna(raw_max_dist) and raw_max_dist > 0:
+      cal_ratio = total_dist_m / raw_max_dist
+      if abs(cal_ratio - 1.0) > 0.005:
+        df_records['distance'] = df_records['distance'] * cal_ratio
+        if 'enhanced_speed' in df_records.columns:
+          df_records['enhanced_speed'] = df_records['enhanced_speed'] * cal_ratio
+
   if (
       total_dist_m is None
       and not df_records.empty
@@ -363,6 +388,9 @@ def build_activity_database(folder_path='fit test files'):
       with open(file_path, 'rb') as f:
         raw_bytes = f.read()
       s = ingest_fit_bytes(fname, raw_bytes, DB_NAME)
+      if s is None:
+        print(f'Skipped non-running file: {fname}')
+        continue
       print(
           f"Synced: {s['file_name']} | Max HR: {s['max_heart_rate']} | {s['workout_tag']}"
       )

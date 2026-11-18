@@ -409,17 +409,22 @@ if 'ingested_files' not in st.session_state:
 
 if uploaded_files:
   newly_added = 0
+  skipped_sport = 0
   for uf in uploaded_files:
     file_sig = f'{uf.name}_{uf.size}'
     if file_sig not in st.session_state['ingested_files']:
-      with st.sidebar.spinner(f'Saving {uf.name} to vault...'):
-        ingest_fit_bytes(uf.name, uf.getvalue(), DB_NAME)
+      with st.sidebar.spinner(f'Processing {uf.name}...'):
+        res = ingest_fit_bytes(uf.name, uf.getvalue(), DB_NAME)
         st.session_state['ingested_files'].add(file_sig)
-        newly_added += 1
+        if res is not None:
+          newly_added += 1
+        else:
+          skipped_sport += 1
   if newly_added > 0:
     push_vault_to_cloud(DB_NAME)
     st.sidebar.success(f'Added {newly_added} run(s) to persistent vault.')
-
+  if skipped_sport > 0:
+    st.sidebar.info(f'Skipped {skipped_sport} non-running activity file(s).')
 active_hr_max, active_hr_rest, peak_src, last_upd = get_athlete_baselines(
     DB_NAME
 )
@@ -775,15 +780,38 @@ else:
       raw_bytes = gzip.decompress(gz_row[0])
       data = parse_fit_bytes_raw(raw_bytes)
 
+      session_dist_m = None
+      if not data['session'].empty and 'total_distance' in data['session'].columns:
+        session_dist_m = data['session']['total_distance'].dropna().iloc[-1]
+
+      if (
+          session_dist_m
+          and not data['records'].empty
+          and 'distance' in data['records'].columns
+      ):
+        raw_max_m = data['records']['distance'].max()
+        if pd.notna(raw_max_m) and raw_max_m > 0:
+          cal_ratio = session_dist_m / raw_max_m
+          if abs(cal_ratio - 1.0) > 0.005:
+            data['records']['distance'] = data['records']['distance'] * cal_ratio
+            if 'enhanced_speed' in data['records'].columns:
+              data['records']['enhanced_speed'] = (
+                  data['records']['enhanced_speed'] * cal_ratio
+              )
+
       df_records = clean_records(data['records'])
       df_native_splits = extract_native_laps(data['laps'])
       df_best_efforts = calculate_best_efforts(df_records)
 
       total_dist_mi = (
+      session_dist_m / 1609.34
+      if session_dist_m
+      else (
           df_records['distance'].max() / 1609.34
           if not df_records.empty and 'distance' in df_records.columns
           else 0.0
       )
+  )
       total_time_sec = df_records['dt'].sum() if not df_records.empty else 0.0
 
       avg_hr_run = (
