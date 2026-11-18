@@ -32,6 +32,37 @@ def format_seconds_to_time(seconds):
   return f'{mins}m {secs:02d}s'
 
 
+def parse_time_str_to_seconds(time_str):
+  """Parses 'MM:SS', 'HH:MM:SS', or '16m 35s' strings into float seconds."""
+  if not time_str or not str(time_str).strip():
+    return None
+  s = str(time_str).strip().lower()
+  try:
+    if ':' in s:
+      parts = [float(p.strip()) for p in s.split(':')]
+      if len(parts) == 2:
+        return parts[0] * 60.0 + parts[1]
+      if len(parts) == 3:
+        return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+    total = 0.0
+    matched = False
+    for token in s.replace('s', 's ').replace('m', 'm ').replace('h', 'h ').split():
+      if token.endswith('h'):
+        total += float(token[:-1]) * 3600.0
+        matched = True
+      elif token.endswith('m'):
+        total += float(token[:-1]) * 60.0
+        matched = True
+      elif token.endswith('s'):
+        total += float(token[:-1])
+        matched = True
+    if matched and total > 0:
+      return total
+    return float(s)
+  except Exception:
+    return None
+
+
 def format_pace_per_mile(seconds, dist_m):
   """Formats pace per mile (MM:SS /mi) given duration and distance in meters."""
   if not seconds or not dist_m or seconds <= 0 or dist_m <= 0:
@@ -46,7 +77,7 @@ def format_pace_per_mile(seconds, dist_m):
 
 
 def init_baselines_table(db_path=DB_NAME, default_max=190.0, default_rest=50.0):
-  """Creates athlete_baselines and best_efforts tables in SQLite."""
+  """Creates athlete_baselines, best_efforts, and manual_prs tables in SQLite."""
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
   cursor.execute('''
@@ -80,15 +111,53 @@ def init_baselines_table(db_path=DB_NAME, default_max=190.0, default_rest=50.0):
           PRIMARY KEY (file_name, distance_label)
       )
   ''')
+
+  cursor.execute('''
+      CREATE TABLE IF NOT EXISTS manual_prs (
+          distance_label TEXT PRIMARY KEY,
+          distance_meters REAL,
+          duration_seconds REAL,
+          activity_date TEXT
+      )
+  ''')
+  conn.commit()
+  conn.close()
+
+
+def set_manual_pr(distance_label, duration_seconds, activity_date=None, db_path=DB_NAME):
+  """Saves or updates a manual PR override for a standard distance."""
+  if distance_label not in STANDARD_DISTANCES_M or not duration_seconds or duration_seconds <= 0:
+    return False
+  init_baselines_table(db_path)
+  dist_m = STANDARD_DISTANCES_M[distance_label]
+  date_str = str(activity_date)[:10] if activity_date else datetime.now().strftime('%Y-%m-%d')
+  conn = sqlite3.connect(db_path)
+  conn.execute(
+      '''
+      INSERT INTO manual_prs (distance_label, distance_meters, duration_seconds, activity_date)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(distance_label) DO UPDATE SET
+          duration_seconds = excluded.duration_seconds,
+          activity_date = excluded.activity_date
+      ''',
+      (distance_label, dist_m, round(float(duration_seconds), 1), date_str),
+  )
+  conn.commit()
+  conn.close()
+  return True
+
+
+def delete_manual_pr(distance_label, db_path=DB_NAME):
+  """Removes a manual PR override so the vault reverts to the fastest .fit effort."""
+  init_baselines_table(db_path)
+  conn = sqlite3.connect(db_path)
+  conn.execute('DELETE FROM manual_prs WHERE distance_label = ?', (distance_label,))
   conn.commit()
   conn.close()
 
 
 def extract_best_efforts_from_df(df_records):
-  """Runs sliding-window search across a cleaned/raw records DataFrame
-
-  and returns a list of dicts with fastest times for standard distances.
-  """
+  """Runs sliding-window search across a cleaned/raw records DataFrame."""
   if df_records.empty or 'distance' not in df_records.columns:
     return []
 
@@ -122,7 +191,6 @@ def extract_best_efforts_from_df(df_records):
           best_time_sec = dur_sec
         left += 1
 
-    # Basic sanity filter against GPS teleportation glitches (> 10.5 m/s world record sprint)
     if best_time_sec != float('inf') and (target_dist / best_time_sec) <= 10.5:
       efforts.append({
           'distance_label': label,
@@ -166,7 +234,7 @@ def save_best_efforts_to_db(
 
 
 def get_all_time_prs(db_path=DB_NAME):
-  """Returns a DataFrame of all-time fastest recorded PRs across all files in SQLite."""
+  """Returns all-time PRs, merging manual_prs overrides on top of .fit best_efforts."""
   init_baselines_table(db_path)
   conn = sqlite3.connect(db_path)
   query = '''
@@ -187,78 +255,108 @@ def get_all_time_prs(db_path=DB_NAME):
       GROUP BY b.distance_label
       ORDER BY b.distance_meters ASC
   '''
-  df_prs = pd.read_sql(query, conn)
+  df_fit_prs = pd.read_sql(query, conn)
+  df_manual = pd.read_sql('SELECT * FROM manual_prs', conn)
   conn.close()
 
-  if not df_prs.empty:
-    df_prs['Recorded PR Time'] = df_prs['duration_seconds'].apply(
-        format_seconds_to_time
-    )
-    df_prs['Recorded PR Pace'] = df_prs.apply(
-        lambda r: format_pace_per_mile(
-            r['duration_seconds'], r['distance_meters']
-        ),
-        axis=1,
-    )
+  pr_map = {}
+  for _, row in df_fit_prs.iterrows():
+    pr_map[row['distance_label']] = {
+        'distance_label': row['distance_label'],
+        'distance_meters': float(row['distance_meters']),
+        'duration_seconds': float(row['duration_seconds']),
+        'file_name': row['file_name'],
+        'activity_date': row['activity_date'],
+    }
+
+  for _, mrow in df_manual.iterrows():
+    lbl = mrow['distance_label']
+    pr_map[lbl] = {
+        'distance_label': lbl,
+        'distance_meters': float(mrow['distance_meters']),
+        'duration_seconds': float(mrow['duration_seconds']),
+        'file_name': 'Manual PR Override',
+        'activity_date': mrow['activity_date'],
+    }
+
+  if not pr_map:
+    return pd.DataFrame()
+
+  df_prs = pd.DataFrame(list(pr_map.values())).sort_values('distance_meters').reset_index(drop=True)
+  df_prs['Recorded PR Time'] = df_prs['duration_seconds'].apply(
+      format_seconds_to_time
+  )
+  df_prs['Recorded PR Pace'] = df_prs.apply(
+      lambda r: format_pace_per_mile(
+          r['duration_seconds'], r['distance_meters']
+      ),
+      axis=1,
+  )
   return df_prs
 
 
 def get_athlete_baselines(db_path=DB_NAME):
-  """Returns the active (hr_max, hr_rest, peak_source_file, last_updated) from SQLite."""
+  """Returns (hr_max, hr_rest, peak_source_file, last_updated) while honoring Manual Override."""
   init_baselines_table(db_path)
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
 
-  tables = {
-      r[0]
-      for r in cursor.execute(
-          "SELECT name FROM sqlite_master WHERE type='table'"
-      ).fetchall()
-  }
-  if 'activities' in tables:
-    cols = {
-        r[1]
-        for r in cursor.execute('PRAGMA table_info(activities)').fetchall()
+  row = cursor.execute(
+      'SELECT hr_max, hr_rest, peak_source_file, last_updated FROM athlete_baselines WHERE id = 1'
+  ).fetchone()
+  curr_max, curr_rest, peak_src, last_upd = (
+      float(row[0]),
+      float(row[1]),
+      row[2],
+      row[3],
+  )
+
+  # Only auto-promote peak HR from activities if NOT locked by Manual Override
+  if peak_src != 'Manual Override':
+    tables = {
+        r[0]
+        for r in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
     }
-    if 'max_heart_rate' in cols:
-      peak_row = cursor.execute('''
-          SELECT max_heart_rate, file_name
-          FROM activities
-          WHERE max_heart_rate IS NOT NULL AND max_heart_rate <= 220
-          ORDER BY max_heart_rate DESC
-          LIMIT 1
-      ''').fetchone()
-      if peak_row and peak_row[0]:
-        curr_max = cursor.execute(
-            'SELECT hr_max FROM athlete_baselines WHERE id = 1'
-        ).fetchone()[0]
-        if float(peak_row[0]) > float(curr_max):
+    if 'activities' in tables:
+      cols = {
+          r[1]
+          for r in cursor.execute('PRAGMA table_info(activities)').fetchall()
+      }
+      if 'max_heart_rate' in cols:
+        peak_row = cursor.execute('''
+            SELECT max_heart_rate, file_name
+            FROM activities
+            WHERE max_heart_rate IS NOT NULL AND max_heart_rate <= 220
+            ORDER BY max_heart_rate DESC
+            LIMIT 1
+        ''').fetchone()
+        if peak_row and peak_row[0] and float(peak_row[0]) > curr_max:
+          curr_max = float(peak_row[0])
+          peak_src = peak_row[1]
+          last_upd = datetime.now().strftime('%Y-%m-%d %H:%M')
           cursor.execute(
               '''
               UPDATE athlete_baselines
               SET hr_max = ?, peak_source_file = ?, last_updated = ?
               WHERE id = 1
               ''',
-              (
-                  float(peak_row[0]),
-                  peak_row[1],
-                  datetime.now().strftime('%Y-%m-%d %H:%M'),
-              ),
+              (curr_max, peak_src, last_upd),
           )
           conn.commit()
 
-  row = cursor.execute(
-      'SELECT hr_max, hr_rest, peak_source_file, last_updated FROM athlete_baselines WHERE id = 1'
-  ).fetchone()
   conn.close()
-  return float(row[0]), float(row[1]), row[2], row[3]
+  return curr_max, curr_rest, peak_src, last_upd
 
 
-def recalculate_vault_trimp(db_path=DB_NAME):
+def recalculate_vault_trimp(db_path=DB_NAME, hr_max=None, hr_rest=None):
   """Recalculates Banister TRIMP across all stored activities when HR baselines change."""
   if not os.path.exists(db_path):
     return
-  hr_max, hr_rest, _, _ = get_athlete_baselines(db_path)
+  if hr_max is None or hr_rest is None:
+    hr_max, hr_rest, _, _ = get_athlete_baselines(db_path)
+
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
   tables = {
@@ -289,13 +387,32 @@ def update_athlete_baselines(
     source_file=None,
     new_hr_rest=None,
     manual_hr_max=None,
+    reset_auto_max=False,
 ):
-  """Updates HR baselines if a new peak HR is observed or manual settings are saved."""
+  """Updates HR baselines and recalculates vault TRIMP while respecting Manual Override."""
   hr_max, hr_rest, peak_file, _ = get_athlete_baselines(db_path)
   changed = False
 
+  if reset_auto_max:
+    conn = sqlite3.connect(db_path)
+    peak_row = conn.execute('''
+        SELECT max_heart_rate, file_name
+        FROM activities
+        WHERE max_heart_rate IS NOT NULL AND max_heart_rate <= 220
+        ORDER BY max_heart_rate DESC
+        LIMIT 1
+    ''').fetchone()
+    conn.close()
+    if peak_row and peak_row[0]:
+      hr_max = round(float(peak_row[0]), 1)
+      peak_file = peak_row[1]
+    else:
+      peak_file = 'Default Baseline'
+    changed = True
+
   if (
       candidate_max_hr is not None
+      and peak_file != 'Manual Override'
       and 100 < candidate_max_hr <= 220
       and candidate_max_hr > hr_max
   ):
@@ -303,12 +420,13 @@ def update_athlete_baselines(
     peak_file = source_file or 'Uploaded Activity'
     changed = True
 
-  if manual_hr_max is not None and float(manual_hr_max) != hr_max:
-    hr_max = round(float(manual_hr_max), 1)
-    peak_file = 'Manual Override'
-    changed = True
+  if manual_hr_max is not None:
+    if round(float(manual_hr_max), 1) != hr_max or peak_file != 'Manual Override':
+      hr_max = round(float(manual_hr_max), 1)
+      peak_file = 'Manual Override'
+      changed = True
 
-  if new_hr_rest is not None and float(new_hr_rest) != hr_rest:
+  if new_hr_rest is not None and round(float(new_hr_rest), 1) != hr_rest:
     hr_rest = round(float(new_hr_rest), 1)
     changed = True
 
@@ -324,7 +442,7 @@ def update_athlete_baselines(
     )
     conn.commit()
     conn.close()
-    recalculate_vault_trimp(db_path)
+    recalculate_vault_trimp(db_path, hr_max=hr_max, hr_rest=hr_rest)
 
   return hr_max, hr_rest, changed
 
@@ -484,55 +602,117 @@ def compute_performance_management_chart(df_history):
   return df_timeline
 
 
-def predict_race_times(known_dist_m, known_time_sec, df_prs=None):
-  """Predicts race times using Riegel's Formula: T2 = T1 * (D2 / D1)^1.06,
+def predict_race_times(
+    known_dist_m=None,
+    known_time_sec=None,
+    df_prs=None,
+    current_ctl=45.0,
+    weekly_miles_avg=35.0,
+    selected_pr_labels=None,
+):
+  """Projects race times using an Aggregate Multi-PR + CTL Endurance Decay model
 
-  while keeping Actual Recorded PRs in a separate comparison column.
+  alongside pure Riegel (b=1.06) for comparison.
   """
   target_distances = [
-      ('1 Mile', 1609.34),
-      ('2 Mile', 3218.68),
-      ('5K', 5000.0),
-      ('10K', 10000.0),
-      ('Half Marathon', 21097.5),
-      ('Marathon', 42195.0),
+      ('1 Mile', 1609.34, 30.0, 25.0),
+      ('2 Mile', 3218.68, 38.0, 30.0),
+      ('5K', 5000.0, 45.0, 35.0),
+      ('10K', 10000.0, 58.0, 45.0),
+      ('Half Marathon', 21097.5, 72.0, 55.0),
+      ('Marathon', 42195.0, 90.0, 70.0),
   ]
 
   pr_lookup = {}
   if df_prs is not None and not df_prs.empty:
     for _, row in df_prs.iterrows():
       pr_lookup[row['distance_label']] = (
-          row['duration_seconds'],
+          float(row['distance_meters']),
+          float(row['duration_seconds']),
           row['Recorded PR Time'],
           row['activity_date'],
+          row['file_name'],
       )
 
+  # Determine active PR benchmarks to aggregate
+  active_benchmarks = []
+  if selected_pr_labels and pr_lookup:
+    for lbl in selected_pr_labels:
+      if lbl in pr_lookup:
+        d_m, t_s, _, _, _ = pr_lookup[lbl]
+        active_benchmarks.append((lbl, d_m, t_s))
+  elif known_dist_m and known_time_sec:
+    active_benchmarks.append(('Selected', float(known_dist_m), float(known_time_sec)))
+  elif pr_lookup:
+    for lbl, (d_m, t_s, _, _, _) in pr_lookup.items():
+      active_benchmarks.append((lbl, d_m, t_s))
+
+  # Fit personal fatigue exponent from selected PRs (bounded to physiological range)
+  base_exponent = 1.075
+  if len(active_benchmarks) >= 2:
+    xs = np.log([b[1] for b in active_benchmarks])
+    ys = np.log([b[2] for b in active_benchmarks])
+    if np.std(xs) > 0:
+      slope = float(np.polyfit(xs, ys, 1)[0])
+      base_exponent = float(np.clip(slope, 1.055, 1.12))
+
   predictions = []
-  for label, target_dist in target_distances:
-    predicted_sec = known_time_sec * (target_dist / known_dist_m) ** 1.06
+  for label, target_dist, req_ctl, req_mpw in target_distances:
+    # Compute CTL & Weekly Mileage endurance penalty for distances > 3200m
+    ctl_deficit = max(0.0, (req_ctl - float(current_ctl)) / 100.0)
+    mpw_deficit = max(0.0, (req_mpw - float(weekly_miles_avg)) / 100.0)
+    endurance_penalty = (0.11 * ctl_deficit) + (0.07 * mpw_deficit)
+
+    weighted_preds = []
+    weights = []
+    riegel_preds = []
+
+    for _, b_dist, b_time in active_benchmarks:
+      dist_ratio = target_dist / b_dist
+      if dist_ratio > 1.0:
+        eff_exp = base_exponent + endurance_penalty
+      else:
+        eff_exp = max(1.05, base_exponent - 0.01)
+
+      pred_i = b_time * (dist_ratio ** eff_exp)
+      riegel_i = b_time * (dist_ratio ** 1.06)
+
+      # Weight closer distances higher in log-distance space
+      log_dist_gap = abs(np.log(target_dist / b_dist))
+      w_i = 1.0 / (0.25 + log_dist_gap)
+      weighted_preds.append(pred_i * w_i)
+      riegel_preds.append(riegel_i * w_i)
+      weights.append(w_i)
+
+    predicted_sec = sum(weighted_preds) / sum(weights) if weights else 0.0
+    riegel_sec = sum(riegel_preds) / sum(weights) if weights else 0.0
+
     pred_time_str = format_seconds_to_time(predicted_sec)
     pred_pace_str = format_pace_per_mile(predicted_sec, target_dist)
+    riegel_time_str = format_seconds_to_time(riegel_sec)
 
     if label in pr_lookup:
-      actual_sec, actual_str, actual_date = pr_lookup[label]
-      actual_display = f'{actual_str} ({actual_date})'
+      _, actual_sec, actual_str, actual_date, src_file = pr_lookup[label]
+      src_tag = ' [Manual]' if src_file == 'Manual PR Override' else ''
+      actual_display = f'{actual_str} ({actual_date}){src_tag}'
       diff_sec = actual_sec - predicted_sec
-      if abs(diff_sec) < 1.0:
-        gap_str = 'Benchmark PR'
+      if abs(diff_sec) < 2.0:
+        gap_str = 'Aligned with PR'
       elif diff_sec > 0:
         gap_str = f'-{format_seconds_to_time(diff_sec)} faster potential'
       else:
-        gap_str = f'+{format_seconds_to_time(abs(diff_sec))} ahead of curve'
+        gap_str = f'+{format_seconds_to_time(abs(diff_sec))} ahead of model'
     else:
       actual_display = 'Not raced / logged yet'
-      gap_str = 'Projected'
+      gap_str = 'CTL-Adjusted Projection'
 
     predictions.append({
         'Race Distance': label,
-        'Actual Recorded PR (Vault)': actual_display,
-        'Riegel Predicted Time': pred_time_str,
+        'Actual / Calibrated PR': actual_display,
+        'CTL + Multi-PR Prediction': pred_time_str,
         'Predicted Pace': pred_pace_str,
-        'PR vs. Prediction': gap_str,
+        'Pure Riegel (1.06)': riegel_time_str,
+        'PR vs. Model': gap_str,
     })
 
   return pd.DataFrame(predictions)

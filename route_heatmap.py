@@ -18,6 +18,16 @@ TAG_COLORS = {
     'Race': [255, 255, 255, 245],
 }
 
+# High-visibility color ramp so single-pass roads are clearly legible while high-traffic routes glow bright
+HEATMAP_COLOR_RANGE = [
+    [185, 35, 45, 195],    # Low density (1 run): Visible warm crimson
+    [225, 65, 35, 215],    # Light-medium density: Bright scarlet
+    [245, 115, 25, 230],   # Medium density: Deep orange
+    [255, 170, 35, 240],   # High density: Golden amber
+    [255, 225, 105, 250],  # Very high density: Bright yellow
+    [255, 255, 215, 255],  # Core hotspots: White-gold glow
+]
+
 
 def init_gps_table():
   """Creates the gps_points table inside training_vault.db if missing."""
@@ -214,20 +224,21 @@ def render_heatmap_tab():
 
   if map_mode == 'Heat Density Glow':
     radius_px = st.sidebar.slider(
-        'Heat Radius (px)', min_value=5, max_value=40, value=14
+        'Heat Radius (px)', min_value=5, max_value=40, value=16
     )
     intensity = st.sidebar.slider(
-        'Heat Intensity', min_value=0.5, max_value=5.0, value=1.5, step=0.5
+        'Heat Intensity', min_value=0.5, max_value=6.0, value=2.4, step=0.2
     )
 
     layer = pdk.Layer(
         'HeatmapLayer',
         data=df_gps,
         get_position='[lon, lat]',
-        opacity=0.85,
+        color_range=HEATMAP_COLOR_RANGE,
+        opacity=0.95,
         radiusPixels=radius_px,
         intensity=intensity,
-        threshold=0.05,
+        threshold=0.005,
     )
     tooltip = None
   else:

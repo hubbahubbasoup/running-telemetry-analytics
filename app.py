@@ -10,7 +10,12 @@ import numpy as np
 import pandas as pd
 from fitparse import FitFile
 import streamlit as st
-from aggregate_runs import build_activity_database, init_db, ingest_fit_bytes
+from aggregate_runs import (
+    backfill_activity_locations,
+    build_activity_database,
+    init_db,
+    ingest_fit_bytes,
+)
 from cloud_vault import (
     check_password_gate,
     ensure_local_vault,
@@ -20,15 +25,20 @@ from cloud_vault import (
     push_vault_to_cloud,
 )
 from hr_analytics import (
+    STANDARD_DISTANCES_M,
     calculate_karvonen_zones,
     compute_banister_trimp,
     compute_performance_management_chart,
     compute_time_in_zones,
+    delete_manual_pr,
     extract_best_efforts_from_df,
+    format_seconds_to_time,
     get_all_time_prs,
     get_athlete_baselines,
+    parse_time_str_to_seconds,
     predict_race_times,
     save_best_efforts_to_db,
+    set_manual_pr,
     update_athlete_baselines,
 )
 from route_heatmap import render_heatmap_tab
@@ -39,7 +49,7 @@ st.set_page_config(
     layout='wide',
 )
 
-# --- DARK-RED THEME, CALM DARK-GREY SIDEBAR & CORMORANT FONT STYLING ---
+# --- DARK-RED THEME, CALM DARK-GREY SIDEBAR & NON-TRUNCATED METRIC HEADINGS ---
 st.markdown(
     """
     <style>
@@ -93,13 +103,21 @@ st.markdown(
         background-color: var(--bg-card);
         border: 1px solid #451010;
         border-left: 3px solid var(--accent-bright);
-        padding: 12px 16px;
+        padding: 12px 14px;
         border-radius: 6px;
     }
 
-    div[data-testid="stMetricLabel"] {
+    /* Prevent metric headings from truncating with ellipsis (...) */
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] > div,
+    div[data-testid="stMetricLabel"] p {
         color: var(--text-muted) !important;
-        font-size: 1.0rem !important;
+        font-size: 0.98rem !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: unset !important;
+        word-break: break-word !important;
+        line-height: 1.25 !important;
     }
 
     div[data-testid="stMetricValue"] {
@@ -142,6 +160,10 @@ check_password_gate()
 ensure_local_vault(DB_NAME)
 init_db(DB_NAME)
 
+# Backfill city/state once if any existing runs are missing geocoded locations
+if backfill_activity_locations(DB_NAME):
+  push_vault_to_cloud(DB_NAME)
+
 ZONE_PALETTE = {
     'Zone 1 (Recovery)': '#9ca3af',   # Grey (Zone 0/1)
     'Zone 2 (Endurance)': '#38bdf8',  # Light Blue
@@ -151,6 +173,21 @@ ZONE_PALETTE = {
 }
 
 # --- HELPER FUNCTIONS ---
+
+
+def pace_str_to_seconds(pace_str):
+  """Converts 'MM:SS /mi' into float seconds per mile for accurate sorting/filtering."""
+  if not pace_str or not isinstance(pace_str, str):
+    return 9999.0
+  clean = pace_str.replace('/mi', '').strip()
+  if ':' not in clean:
+    return 9999.0
+  try:
+    m, s = clean.split(':')
+    sec = int(m) * 60 + int(s)
+    return float(sec) if sec > 0 else 9999.0
+  except Exception:
+    return 9999.0
 
 
 def get_hr_zone_color(hr_val, zones):
@@ -166,51 +203,6 @@ def get_hr_zone_color(hr_val, zones):
   if hr_val <= zones['Zone 4 (Threshold)'][1]:
     return ZONE_PALETTE['Zone 4 (Threshold)']
   return ZONE_PALETTE['Zone 5 (VO2 Max)']
-
-
-def classify_workout(df_records, total_dist_mi, total_time_sec, zones):
-  if df_records.empty:
-    return 'General Run'
-
-  pace_std = 0.0
-  pace_cv = 0.0
-  if 'enhanced_speed' in df_records.columns:
-    running_mask = df_records['enhanced_speed'] >= 2.0
-    clean_speeds = df_records.loc[running_mask, 'enhanced_speed'].dropna()
-    if not clean_speeds.empty:
-      sec_per_mile = 1609.34 / clean_speeds
-      pace_decimal = sec_per_mile / 60.0
-      pace_std = pace_decimal.std()
-      pace_mean = pace_decimal.mean()
-      pace_cv = pace_std / pace_mean if pace_mean > 0 else 0.0
-
-  avg_hr = (
-      df_records['heart_rate'].mean()
-      if 'heart_rate' in df_records.columns
-      and df_records['heart_rate'].notna().any()
-      else None
-  )
-
-  z1_upper = zones['Zone 1 (Recovery)'][1]
-  z3_upper = zones['Zone 3 (Tempo)'][1]
-
-  is_long_distance = total_dist_mi >= 9.0 or (total_time_sec / 60) >= 75
-
-  if is_long_distance:
-    if pace_cv > 0.10 or pace_std > 0.75:
-      return 'Tempo / Quality Long Run'
-    else:
-      return 'Long Run'
-
-  if pace_std > 1.2 or pace_cv > 0.15:
-    return 'Intervals / Speedwork'
-
-  if avg_hr and avg_hr <= z1_upper:
-    return 'Recovery / Easy'
-  elif avg_hr and avg_hr >= z3_upper:
-    return 'Tempo / Threshold'
-
-  return 'Base Run'
 
 
 def calculate_aerobic_decoupling(df_records):
@@ -453,6 +445,15 @@ with st.sidebar.expander('Dynamic Athlete Baselines', expanded=False):
     st.success('Vault baselines & TRIMP updated.')
     st.rerun()
 
+  if peak_src == 'Manual Override':
+    if st.button('Reset Max HR to Auto-Detected Peak'):
+      active_hr_max, active_hr_rest, _ = update_athlete_baselines(
+          DB_NAME, reset_auto_max=True
+      )
+      push_vault_to_cloud(DB_NAME)
+      st.success('Re-enabled auto-detected peak HR.')
+      st.rerun()
+
   if st.button('Sync Local .fit Folder to Vault'):
     with st.spinner('Ingesting local .fit files & updating vault...'):
       build_activity_database('fit test files')
@@ -480,22 +481,118 @@ if page_mode == 'Training History & Fitness':
     current_atl = df_pmc['ATL'].iloc[-1] if not df_pmc.empty else 0.0
     current_tsb = df_pmc['TSB'].iloc[-1] if not df_pmc.empty else 0.0
 
-    total_lifetime_miles = df_history['distance_miles'].sum()
-    total_activities = len(df_history)
+    # --- PERIOD SUMMARY SELECTOR (WEEK / MONTH / YEAR) ---
+    df_history['week_start'] = (
+        df_history['date'].dt.to_period('W-SUN').apply(lambda r: r.start_time)
+    )
+    df_history['month_label'] = df_history['date'].dt.strftime('%Y-%m')
+    df_history['year_label'] = df_history['date'].dt.strftime('%Y')
+
+    c_mode, c_sel = st.columns([1.2, 2.8])
+    with c_mode:
+      period_granularity = st.radio(
+          'Summary Timeframe',
+          ['Week (Mon-Sun)', 'Month', 'Year'],
+          horizontal=True,
+      )
+
+    if period_granularity == 'Week (Mon-Sun)':
+      all_periods = sorted(df_history['week_start'].unique(), reverse=True)
+      period_labels = {
+          f"{pd.Timestamp(p).strftime('%Y-%m-%d')} to {(pd.Timestamp(p) + pd.Timedelta(days=6)).strftime('%Y-%m-%d')}": p
+          for p in all_periods
+      }
+      with c_sel:
+        chosen_lbl = st.selectbox('Select Week', list(period_labels.keys()))
+      chosen_val = period_labels[chosen_lbl]
+      df_period = df_history[df_history['week_start'] == chosen_val]
+      prev_val = pd.Timestamp(chosen_val) - pd.Timedelta(days=7)
+      df_prev = df_history[df_history['week_start'] == prev_val]
+      unit_name = 'wk'
+    elif period_granularity == 'Month':
+      all_periods = sorted(df_history['month_label'].unique(), reverse=True)
+      with c_sel:
+        chosen_val = st.selectbox('Select Month', all_periods)
+      df_period = df_history[df_history['month_label'] == chosen_val]
+      idx_p = all_periods.index(chosen_val)
+      df_prev = (
+          df_history[df_history['month_label'] == all_periods[idx_p + 1]]
+          if idx_p + 1 < len(all_periods)
+          else pd.DataFrame()
+      )
+      unit_name = 'mo'
+    else:
+      all_periods = sorted(df_history['year_label'].unique(), reverse=True)
+      with c_sel:
+        chosen_val = st.selectbox('Select Year', all_periods)
+      df_period = df_history[df_history['year_label'] == chosen_val]
+      idx_p = all_periods.index(chosen_val)
+      df_prev = (
+          df_history[df_history['year_label'] == all_periods[idx_p + 1]]
+          if idx_p + 1 < len(all_periods)
+          else pd.DataFrame()
+      )
+      unit_name = 'yr'
+
+    period_miles = df_period['distance_miles'].sum()
+    prev_miles = df_prev['distance_miles'].sum() if not df_prev.empty else None
+    miles_delta = (
+        f'{period_miles - prev_miles:+.1f} mi vs prior {unit_name}'
+        if prev_miles is not None
+        else f'{len(df_period)} runs'
+    )
+
+    period_runs = len(df_period)
+    prev_runs = len(df_prev) if not df_prev.empty else None
+    runs_delta = (
+        f'{period_runs - prev_runs:+d} vs prior {unit_name}'
+        if prev_runs is not None
+        else f'{(period_miles / max(1, period_runs)):.1f} mi/run'
+    )
+
+    ctl_status = (
+        'Peak Base'
+        if current_ctl >= 65
+        else (
+            'Solid Base'
+            if current_ctl >= 40
+            else ('Building Base' if current_ctl >= 20 else 'Developing')
+        )
+    )
+    atl_status = (
+        'Low Strain'
+        if current_atl < 25
+        else ('Productive Load' if current_atl <= 55 else 'High Strain')
+    )
+    tsb_status = (
+        'Fresh'
+        if current_tsb > 5
+        else ('Optimal' if current_tsb >= -10 else 'High Fatigue')
+    )
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric('Total Mileage', f'{total_lifetime_miles:.2f} mi')
-    m2.metric('Activities', total_activities)
-    m3.metric('Fitness (CTL)', f'{current_ctl:.1f}')
-    m4.metric('Fatigue (ATL)', f'{current_atl:.1f}')
+    m1.metric(
+        f'{period_granularity.split()[0]} Mileage',
+        f'{period_miles:.2f} mi',
+        delta=miles_delta,
+    )
+    m2.metric(
+        f'{period_granularity.split()[0]} Activities',
+        period_runs,
+        delta=runs_delta,
+    )
+    m3.metric('Fitness (CTL)', f'{current_ctl:.1f}', delta=ctl_status)
+    m4.metric(
+        'Fatigue (ATL)',
+        f'{current_atl:.1f}',
+        delta=atl_status,
+        delta_color='normal' if current_atl <= 55 else 'inverse',
+    )
     m5.metric(
         'Form (TSB)',
         f'{current_tsb:.1f}',
-        delta=(
-            'Fresh'
-            if current_tsb > 5
-            else ('Optimal' if current_tsb >= -10 else 'High Fatigue')
-        ),
+        delta=tsb_status,
+        delta_color='normal' if current_tsb >= -10 else 'inverse',
     )
 
     st.markdown('---')
@@ -512,10 +609,55 @@ if page_mode == 'Training History & Fitness':
       zone_cols[i].metric(zone_name, f'{low} - {high} bpm')
 
     st.markdown('---')
+
+    # --- WEEKLY MILEAGE VOLUME CHART (MONDAY - SUNDAY) ---
+    st.markdown('### Weekly Mileage Volume (Monday – Sunday)')
+    weekly_mi_series = df_history.groupby('week_start')['distance_miles'].sum()
+    full_weeks = pd.date_range(
+        start=weekly_mi_series.index.min(),
+        end=weekly_mi_series.index.max(),
+        freq='W-MON',
+    )
+    df_weekly_mi = pd.DataFrame(index=full_weeks)
+    df_weekly_mi.index.name = 'Week (Mon)'
+    df_weekly_mi['Weekly Miles'] = weekly_mi_series.reindex(
+        full_weeks, fill_value=0.0
+    )
+    df_weekly_mi['4-Week Rolling Avg'] = (
+        df_weekly_mi['Weekly Miles'].rolling(window=4, min_periods=1).mean()
+    )
+
+    recent_4wk_avg = float(df_weekly_mi['4-Week Rolling Avg'].iloc[-1])
+    peak_wk_mi = float(df_weekly_mi['Weekly Miles'].max())
+
+    wm_col1, wm_col2, wm_col3, wm_col4 = st.columns([1.2, 1.2, 1.3, 1.3])
+    wm_col1.metric('Recent 4-Week Avg', f'{recent_4wk_avg:.1f} mi/wk')
+    wm_col2.metric('Peak Weekly Volume', f'{peak_wk_mi:.1f} mi')
+    with wm_col3:
+      show_wk_bars = st.toggle('Show Weekly Miles', value=True)
+    with wm_col4:
+      show_wk_roll = st.toggle('Show 4-Week Rolling Avg', value=True)
+
+    wk_cols_to_plot = []
+    wk_colors = []
+    if show_wk_bars:
+      wk_cols_to_plot.append('Weekly Miles')
+      wk_colors.append('#dc2626')
+    if show_wk_roll:
+      wk_cols_to_plot.append('4-Week Rolling Avg')
+      wk_colors.append('#38bdf8')
+
+    if wk_cols_to_plot:
+      if show_wk_bars and not show_wk_roll:
+        st.bar_chart(df_weekly_mi[['Weekly Miles']], color=['#dc2626'])
+      else:
+        st.line_chart(df_weekly_mi[wk_cols_to_plot], color=wk_colors)
+
+    st.markdown('---')
     st.markdown('### Weekly Time-in-Zone & 80/20 Polarization')
     z_cols = ['z1_min', 'z2_min', 'z3_min', 'z4_min', 'z5_min']
     if all(c in df_history.columns for c in z_cols):
-      df_zones = df_history[['date'] + z_cols].dropna().copy()
+      df_zones = df_history[['date', 'week_start'] + z_cols].dropna().copy()
       if not df_zones.empty and df_zones[z_cols].sum().sum() > 0:
         total_z_mins = df_zones[z_cols].sum().sum()
         easy_mins = df_zones['z1_min'].sum() + df_zones['z2_min'].sum()
@@ -538,11 +680,15 @@ if page_mode == 'Training History & Fitness':
             delta='Target: ~20%',
         )
 
-        df_zones['Week'] = (
-            df_zones['date'].dt.to_period('W').apply(lambda r: r.start_time)
-        )
+        tz1, tz2, tz3, tz4, tz5 = st.columns(5)
+        t_z1 = tz1.toggle('Z1 Recovery', value=True)
+        t_z2 = tz2.toggle('Z2 Endurance', value=True)
+        t_z3 = tz3.toggle('Z3 Tempo', value=True)
+        t_z4 = tz4.toggle('Z4 Threshold', value=True)
+        t_z5 = tz5.toggle('Z5 VO2 Max', value=True)
+
         weekly_zones = (
-            df_zones.groupby('Week')[z_cols]
+            df_zones.groupby('week_start')[z_cols]
             .sum()
             .rename(
                 columns={
@@ -554,10 +700,21 @@ if page_mode == 'Training History & Fitness':
                 }
             )
         )
-        st.bar_chart(
-            weekly_zones,
-            color=['#9ca3af', '#38bdf8', '#4ade80', '#fb923c', '#ef4444'],
-        )
+        zone_toggle_map = [
+            ('Z1 Recovery', t_z1, '#9ca3af'),
+            ('Z2 Endurance', t_z2, '#38bdf8'),
+            ('Z3 Tempo', t_z3, '#4ade80'),
+            ('Z4 Threshold', t_z4, '#fb923c'),
+            ('Z5 VO2 Max', t_z5, '#ef4444'),
+        ]
+        active_z_names = [name for name, on, _ in zone_toggle_map if on]
+        active_z_colors = [col for _, on, col in zone_toggle_map if on]
+
+        if active_z_names:
+          st.bar_chart(
+              weekly_zones[active_z_names],
+              color=active_z_colors,
+          )
       else:
         st.info(
             'Click Sync Local .fit Folder to Vault in the sidebar to populate'
@@ -575,11 +732,26 @@ if page_mode == 'Training History & Fitness':
     )
 
     if not df_pmc.empty:
-      chart_data = df_pmc.set_index('date')[['CTL', 'ATL', 'TSB']]
-      st.line_chart(
-          chart_data,
-          color=['#dc2626', '#38bdf8', '#4ade80'],
-      )
+      pmc_t1, pmc_t2, pmc_t3 = st.columns(3)
+      show_ctl = pmc_t1.toggle('Show Fitness (CTL)', value=True)
+      show_atl = pmc_t2.toggle('Show Fatigue (ATL)', value=True)
+      show_tsb = pmc_t3.toggle('Show Form (TSB)', value=True)
+
+      pmc_series = []
+      pmc_colors = []
+      if show_ctl:
+        pmc_series.append('CTL')
+        pmc_colors.append('#dc2626')
+      if show_atl:
+        pmc_series.append('ATL')
+        pmc_colors.append('#38bdf8')
+      if show_tsb:
+        pmc_series.append('TSB')
+        pmc_colors.append('#4ade80')
+
+      if pmc_series:
+        chart_data = df_pmc.set_index('date')[pmc_series]
+        st.line_chart(chart_data, color=pmc_colors)
 
     st.markdown('---')
 
@@ -612,11 +784,49 @@ if page_mode == 'Training History & Fitness':
 
     df_all_prs = get_all_time_prs(DB_NAME)
 
-    st.markdown('### All-Time Recorded Personal Bests (From .fit Vault)')
+    st.markdown('### All-Time Recorded & Calibrated Personal Bests')
     st.markdown(
-        '*Actual fastest sustained efforts extracted directly from your'
-        ' GPS/time streams (never overwritten by predictions).*'
+        '*Displays your fastest sustained efforts from `.fit` streams merged'
+        ' with any manual GPS calibration overrides.*'
     )
+
+    with st.expander('Manual PR Calibration & Override Editor', expanded=False):
+      st.caption(
+          'Override GPS-overmeasured distances with your official track/road'
+          ' PRs. Changes automatically propagate to the Race Predictor.'
+      )
+      pe1, pe2, pe3, pe4 = st.columns([1.3, 1.3, 1.2, 1.2])
+      with pe1:
+        edit_dist_lbl = st.selectbox(
+            'Distance', list(STANDARD_DISTANCES_M.keys()), index=5
+        )
+      with pe2:
+        edit_time_str = st.text_input(
+            'Official Time (MM:SS or HH:MM:SS)', placeholder='e.g. 16:35'
+        )
+      with pe3:
+        edit_date_str = st.text_input(
+            'Date Achieved (YYYY-MM-DD)',
+            value=pd.Timestamp.today().strftime('%Y-%m-%d'),
+        )
+      with pe4:
+        st.write('')
+        if st.button('Save Manual PR'):
+          parsed_sec = parse_time_str_to_seconds(edit_time_str)
+          if parsed_sec and parsed_sec > 0:
+            set_manual_pr(edit_dist_lbl, parsed_sec, edit_date_str, DB_NAME)
+            push_vault_to_cloud(DB_NAME)
+            st.success(
+                f'Saved {edit_dist_lbl} PR ({format_seconds_to_time(parsed_sec)}).'
+            )
+            st.rerun()
+          else:
+            st.error('Enter a valid time like 16:35 or 4:50.')
+        if st.button('Reset to .fit PR'):
+          delete_manual_pr(edit_dist_lbl, DB_NAME)
+          push_vault_to_cloud(DB_NAME)
+          st.info(f'Reverted {edit_dist_lbl} to auto-detected .fit PR.')
+          st.rerun()
 
     if not df_all_prs.empty:
       pr_display = df_all_prs[[
@@ -629,45 +839,48 @@ if page_mode == 'Training History & Fitness':
           columns={
               'distance_label': 'Distance',
               'activity_date': 'Date Achieved',
-              'file_name': 'Source File',
+              'file_name': 'Source File / Override',
           }
       )
       st.dataframe(pr_display, use_container_width=True, hide_index=True)
 
       st.markdown('---')
       st.markdown(
-          '### Riegel Race Predictor (Actual PRs vs. Predicted Potential)'
+          '### Physiological Race Predictor (Multi-PR + Fitness CTL Model)'
       )
       st.markdown(
-          'Select one of your **Actual Recorded PRs** below to project'
-          ' theoretical race potential across other distances ($T_2 = T_1'
-          ' \\times (D_2 / D_1)^{1.06}$).'
+          'Synthesizes your selected **Personal Bests** with your current'
+          f' **Fitness (`CTL = {current_ctl:.1f}`)** and **Recent 4-Week'
+          f' Mileage (`{recent_4wk_avg:.1f} mi/wk`)** to model realistic'
+          ' endurance decay across longer distances.'
       )
 
-      pr_options = {
-          f"{row['distance_label']} — {row['Recorded PR Time']} ({row['activity_date']})": (
-              row['distance_meters'],
-              row['duration_seconds'],
-          )
-          for _, row in df_all_prs.iterrows()
-      }
-      default_pr_idx = 0
-      for idx, k in enumerate(pr_options.keys()):
-        if k.startswith('5K') or k.startswith('1 Mile'):
-          default_pr_idx = idx
-          break
+      avail_pr_labels = df_all_prs['distance_label'].tolist()
+      default_benchmarks = [
+          d
+          for d in ['800m', '1000m', '1 Mile', '2 Mile', '5K']
+          if d in avail_pr_labels
+      ]
+      if not default_benchmarks:
+        default_benchmarks = avail_pr_labels[:3]
 
-      selected_pr_label = st.selectbox(
-          'Select Recorded PR Benchmark for Projection',
-          list(pr_options.keys()),
-          index=default_pr_idx,
+      selected_pr_benchmarks = st.multiselect(
+          'Active PR Benchmarks Included in Aggregate Model (Uncheck casual'
+          ' un-raced distances)',
+          options=avail_pr_labels,
+          default=default_benchmarks,
       )
-      benchmark_dist_m, benchmark_time_sec = pr_options[selected_pr_label]
 
-      df_predictions = predict_race_times(
-          benchmark_dist_m, benchmark_time_sec, df_all_prs
-      )
-      st.dataframe(df_predictions, use_container_width=True, hide_index=True)
+      if selected_pr_benchmarks:
+        df_predictions = predict_race_times(
+            df_prs=df_all_prs,
+            current_ctl=current_ctl,
+            weekly_miles_avg=recent_4wk_avg,
+            selected_pr_labels=selected_pr_benchmarks,
+        )
+        st.dataframe(df_predictions, use_container_width=True, hide_index=True)
+      else:
+        st.warning('Select at least one PR benchmark above to project race times.')
     else:
       st.info(
           'Click Sync Local .fit Folder to Vault in the sidebar to extract'
@@ -675,7 +888,18 @@ if page_mode == 'Training History & Fitness':
       )
 
     st.markdown('---')
-    st.markdown('### Complete Activity Database (SQLite Vault)')
+    st.markdown('### Complete Activity Database & All-Time Vault Totals')
+    total_lifetime_miles = df_history['distance_miles'].sum()
+    total_activities = len(df_history)
+    total_hours = df_history['duration_minutes'].sum() / 60.0
+    first_run_date = str(df_history['date'].min())[:10]
+
+    at1, at2, at3, at4 = st.columns(4)
+    at1.caption(f'**All-Time Mileage:** {total_lifetime_miles:.2f} mi')
+    at2.caption(f'**All-Time Runs:** {total_activities}')
+    at3.caption(f'**Total Moving Time:** {total_hours:.1f} hrs')
+    at4.caption(f'**Vault Span:** Since {first_run_date}')
+
     st.dataframe(df_history, use_container_width=True)
   else:
     st.warning(
@@ -696,7 +920,11 @@ else:
           a.file_name,
           a.date,
           a.distance_miles,
+          a.duration_minutes,
+          a.avg_pace,
           a.workout_tag,
+          COALESCE(a.city, 'Indoor') AS city,
+          COALESCE(a.state, 'Treadmill') AS state,
           CASE WHEN f.file_name IS NOT NULL THEN 1 ELSE 0 END AS has_raw
       FROM activities a
       LEFT JOIN fit_files f ON a.file_name = f.file_name
@@ -707,24 +935,141 @@ else:
   conn.close()
 
   if not df_saved_runs.empty:
+    df_saved_runs['pace_sec'] = df_saved_runs['avg_pace'].apply(
+        pace_str_to_seconds
+    )
+    df_saved_runs['date_short'] = (
+        df_saved_runs['date'].astype(str).str.slice(0, 10)
+    )
+
+    # --- SEARCH, FILTER & SORT CONTROLS FOR INDIVIDUAL RUNS ---
+    st.sidebar.markdown('---')
+    st.sidebar.header('Search & Sort Runs')
+    search_query = st.sidebar.text_input(
+        'Search Date, City, State, Distance, or Pace',
+        placeholder='e.g. Provo, California, 2026-10, 5:30',
+    )
+
+    with st.sidebar.expander('Filter by Location, Distance & Pace', expanded=False):
+      all_states = sorted(
+          [s for s in df_saved_runs['state'].dropna().unique() if s]
+      )
+      selected_states = st.multiselect('Filter by State', all_states)
+
+      avail_cities_df = (
+          df_saved_runs[df_saved_runs['state'].isin(selected_states)]
+          if selected_states
+          else df_saved_runs
+      )
+      all_cities = sorted(
+          [c for c in avail_cities_df['city'].dropna().unique() if c]
+      )
+      selected_cities = st.multiselect('Filter by City', all_cities)
+
+      max_dist_vault = max(
+          1.0, float(df_saved_runs['distance_miles'].max() or 20.0)
+      )
+      dist_range = st.slider(
+          'Distance Range (mi)',
+          min_value=0.0,
+          max_value=round(max_dist_vault + 0.5, 1),
+          value=(0.0, round(max_dist_vault + 0.5, 1)),
+          step=0.5,
+      )
+
+      pace_filter_max_min = st.slider(
+          'Max Average Pace (min/mi)',
+          min_value=4.0,
+          max_value=15.0,
+          value=15.0,
+          step=0.25,
+      )
+
+    sort_col_label = st.sidebar.selectbox(
+        'Order Activities By',
+        [
+            'Date',
+            'Distance',
+            'Average Pace',
+            'Location (City)',
+            'Location (State)',
+        ],
+    )
+    sort_dir = st.sidebar.radio(
+        'Order Direction', ['Descending', 'Ascending'], horizontal=True
+    )
+
+    # Apply filters
+    df_filtered = df_saved_runs.copy()
+    if search_query.strip():
+      q = search_query.strip().lower()
+      mask = (
+          df_filtered['date_short'].str.lower().str.contains(q, na=False)
+          | df_filtered['city'].str.lower().str.contains(q, na=False)
+          | df_filtered['state'].str.lower().str.contains(q, na=False)
+          | df_filtered['distance_miles'].astype(str).str.contains(q, na=False)
+          | df_filtered['avg_pace'].str.lower().str.contains(q, na=False)
+          | df_filtered['workout_tag'].str.lower().str.contains(q, na=False)
+      )
+      df_filtered = df_filtered[mask]
+
+    if selected_states:
+      df_filtered = df_filtered[df_filtered['state'].isin(selected_states)]
+    if selected_cities:
+      df_filtered = df_filtered[df_filtered['city'].isin(selected_cities)]
+
+    df_filtered = df_filtered[
+        df_filtered['distance_miles'].between(dist_range[0], dist_range[1])
+    ]
+    if pace_filter_max_min < 15.0:
+      df_filtered = df_filtered[
+          df_filtered['pace_sec'] <= (pace_filter_max_min * 60.0)
+      ]
+
+    sort_map = {
+        'Date': 'date',
+        'Distance': 'distance_miles',
+        'Average Pace': 'pace_sec',
+        'Location (City)': 'city',
+        'Location (State)': 'state',
+    }
+    ascending_bool = sort_dir == 'Ascending'
+    df_filtered = df_filtered.sort_values(
+        by=sort_map[sort_col_label], ascending=ascending_bool
+    )
+
+    if df_filtered.empty:
+      st.warning('No activities match your current search/filter criteria.')
+      st.stop()
+
     run_options = {}
-    for _, row in df_saved_runs.iterrows():
-      date_short = str(row['date'])[:10] if row['date'] else 'Unknown Date'
+    for _, row in df_filtered.iterrows():
+      date_short = row['date_short'] if row['date_short'] else 'Unknown Date'
       dist_val = (
           row['distance_miles'] if pd.notna(row['distance_miles']) else 0.0
       )
+      city_only = row['city'] if row['city'] else 'Indoor'
       tag_val = row['workout_tag'] if row['workout_tag'] else 'Base Run'
-      label = f'{date_short} — {dist_val:.2f} mi ({tag_val})'
+      # Index includes Date, Distance, City (without State/Country), and Tag
+      label = f'{date_short} — {dist_val:.2f} mi — {city_only} ({tag_val})'
       if label in run_options:
         label = f"{label} [{row['file_name']}]"
-      run_options[label] = (row['file_name'], row['has_raw'], tag_val)
+      run_options[label] = (
+          row['file_name'],
+          row['has_raw'],
+          tag_val,
+          city_only,
+          row['state'],
+      )
 
     st.sidebar.markdown('---')
-    st.sidebar.header('Select Saved Run')
+    st.sidebar.header(f'Select Saved Run ({len(run_options)})')
     selected_label = st.sidebar.selectbox(
         'Saved Activities in Vault', list(run_options.keys())
     )
-    selected_fname, has_raw_blob, saved_tag = run_options[selected_label]
+    selected_fname, has_raw_blob, saved_tag, sel_city, sel_state = run_options[
+        selected_label
+    ]
 
     workout_categories = [
         'Recovery / Easy',
@@ -764,9 +1109,7 @@ else:
     if not has_raw_blob:
       st.warning(
           f'Run summary for `{selected_fname}` is in the database, but its raw'
-          ' .fit telemetry stream has not been archived yet. Click **Sync Local'
-          ' .fit Folder to Vault** inside the Dynamic Athlete Baselines'
-          ' sidebar menu (or re-upload the file) once to store its full stream.'
+          ' .fit telemetry stream has not been archived yet.'
       )
     else:
       conn = sqlite3.connect(DB_NAME)
@@ -859,6 +1202,7 @@ else:
 
       st.markdown(
           f'**Selected Activity:** `{selected_fname}` &nbsp;|&nbsp;'
+          f' **Location:** `{sel_city}, {sel_state}` &nbsp;|&nbsp;'
           f' **Classification:** `{selected_workout_type}`'
       )
 
@@ -900,110 +1244,130 @@ else:
 
       with tab1:
         st.subheader('High-Resolution Rolling Pace & Heart Rate')
-        plt.rcParams['font.family'] = 'serif'
-        fig, ax1 = plt.subplots(figsize=(10, 4.5), facecolor='#120606')
-        ax1.set_facecolor('#120606')
+        sw1, sw2 = st.columns(2)
+        show_pace_line = sw1.toggle('Show 30s Rolling Pace', value=True)
+        show_hr_line = sw2.toggle('Show Zone-Colored Heart Rate', value=True)
 
-        running_mask = df_records['enhanced_speed'] >= 2.0
-        clean_speed = df_records['enhanced_speed'].where(running_mask, np.nan)
-        sec_per_mile = 1609.34 / clean_speed
-        rolling_pace = (
-            sec_per_mile.rolling(window=30, min_periods=5).mean() / 60
-        )
-        dist_miles = df_records['distance'] / 1609.34
+        if not show_pace_line and not show_hr_line:
+          st.info('Toggle at least one telemetry stream above to display the graph.')
+        else:
+          plt.rcParams['font.family'] = 'serif'
+          fig, ax1 = plt.subplots(figsize=(10, 4.5), facecolor='#120606')
+          ax1.set_facecolor('#120606')
 
-        # White Rolling Pace Line
-        ax1.plot(
-            dist_miles,
-            rolling_pace,
-            color='#ffffff',
-            linewidth=1.6,
-            alpha=0.92,
-            label='30s Rolling Pace',
-        )
-        ax1.set_xlabel('Distance (Miles)', color='#f5ebeb')
-        ax1.set_ylabel('Pace (min/mi)', color='#ffffff')
-        ax1.tick_params(axis='x', colors='#f5ebeb')
-        ax1.tick_params(axis='y', colors='#ffffff')
-
-        for spine in ax1.spines.values():
-          spine.set_color('#451010')
-
-        def pace_formatter(x, pos):
-          if np.isnan(x) or x <= 0:
-            return ''
-          mins = int(x)
-          secs = int(round((x - mins) * 60))
-          if secs == 60:
-            mins += 1
-            secs = 0
-          return f'{mins}:{secs:02d}'
-
-        ax1.yaxis.set_major_formatter(ticker.FuncFormatter(pace_formatter))
-        ax1.invert_yaxis()
-        ax1.grid(True, linestyle='--', color='#3b0d0d', alpha=0.6)
-
-        if (
-            'heart_rate' in df_records.columns
-            and df_records['heart_rate'].notna().any()
-        ):
-          ax2 = ax1.twinx()
-          rolling_hr = (
-              df_records['heart_rate'].rolling(window=30, min_periods=5).mean()
-          )
-
-          x_vals = dist_miles.to_numpy()
-          y_vals = rolling_hr.to_numpy()
-          points = np.array([x_vals, y_vals]).T.reshape(-1, 1, 2)
-          segments = np.concatenate([points[:-1], points[1:]], axis=1)
-
-          valid_seg = ~(
-              np.isnan(x_vals[:-1])
-              | np.isnan(x_vals[1:])
-              | np.isnan(y_vals[:-1])
-              | np.isnan(y_vals[1:])
-          )
-          segments = segments[valid_seg]
-          seg_hrs = 0.5 * (y_vals[:-1][valid_seg] + y_vals[1:][valid_seg])
-          seg_colors = [
-              get_hr_zone_color(hr_v, active_zones) for hr_v in seg_hrs
-          ]
-
-          lc = LineCollection(
-              segments, colors=seg_colors, linewidths=2.0, alpha=0.95
-          )
-          ax2.add_collection(lc)
-
-          valid_hr_vals = y_vals[~np.isnan(y_vals)]
-          if len(valid_hr_vals) > 0:
-            ax2.set_ylim(valid_hr_vals.min() - 5, valid_hr_vals.max() + 5)
-
-          ax2.set_ylabel('Heart Rate (bpm)', color='#f5ebeb')
-          ax2.tick_params(axis='y', colors='#f5ebeb')
-          for spine in ax2.spines.values():
+          dist_miles = df_records['distance'] / 1609.34
+          ax1.set_xlabel('Distance (Miles)', color='#f5ebeb')
+          ax1.tick_params(axis='x', colors='#f5ebeb')
+          ax1.grid(True, linestyle='--', color='#3b0d0d', alpha=0.6)
+          for spine in ax1.spines.values():
             spine.set_color('#451010')
 
-          # Zone color legend above chart
-          legend_handles = [
-              Line2D([0], [0], color='#ffffff', lw=1.6, label='Pace'),
-              Line2D([0], [0], color='#9ca3af', lw=2.2, label='Z0/Z1'),
-              Line2D([0], [0], color='#38bdf8', lw=2.2, label='Z2'),
-              Line2D([0], [0], color='#4ade80', lw=2.2, label='Z3'),
-              Line2D([0], [0], color='#fb923c', lw=2.2, label='Z4'),
-              Line2D([0], [0], color='#ef4444', lw=2.2, label='Z5'),
-          ]
-          ax1.legend(
-              handles=legend_handles,
-              loc='upper center',
-              bbox_to_anchor=(0.5, 1.13),
-              ncol=6,
-              frameon=False,
-              labelcolor='#f5ebeb',
-              fontsize=9.5,
-          )
+          def pace_formatter(x, pos):
+            if np.isnan(x) or x <= 0:
+              return ''
+            mins = int(x)
+            secs = int(round((x - mins) * 60))
+            if secs == 60:
+              mins += 1
+              secs = 0
+            return f'{mins}:{secs:02d}'
 
-        fig.tight_layout()
-        st.pyplot(fig)
+          if show_pace_line and 'enhanced_speed' in df_records.columns:
+            running_mask = df_records['enhanced_speed'] >= 2.0
+            clean_speed = df_records['enhanced_speed'].where(
+                running_mask, np.nan
+            )
+            sec_per_mile = 1609.34 / clean_speed
+            rolling_pace = (
+                sec_per_mile.rolling(window=30, min_periods=5).mean() / 60
+            )
+            ax1.plot(
+                dist_miles,
+                rolling_pace,
+                color='#ffffff',
+                linewidth=1.6,
+                alpha=0.92,
+                label='30s Rolling Pace',
+            )
+            ax1.set_ylabel('Pace (min/mi)', color='#ffffff')
+            ax1.tick_params(axis='y', colors='#ffffff')
+            ax1.yaxis.set_major_formatter(ticker.FuncFormatter(pace_formatter))
+            ax1.invert_yaxis()
+
+          if (
+              show_hr_line
+              and 'heart_rate' in df_records.columns
+              and df_records['heart_rate'].notna().any()
+          ):
+            hr_ax = ax1.twinx() if show_pace_line else ax1
+            rolling_hr = (
+                df_records['heart_rate']
+                .rolling(window=30, min_periods=5)
+                .mean()
+            )
+
+            x_vals = dist_miles.to_numpy()
+            y_vals = rolling_hr.to_numpy()
+            points = np.array([x_vals, y_vals]).T.reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+            valid_seg = ~(
+                np.isnan(x_vals[:-1])
+                | np.isnan(x_vals[1:])
+                | np.isnan(y_vals[:-1])
+                | np.isnan(y_vals[1:])
+            )
+            segments = segments[valid_seg]
+            seg_hrs = 0.5 * (y_vals[:-1][valid_seg] + y_vals[1:][valid_seg])
+            seg_colors = [
+                get_hr_zone_color(hr_v, active_zones) for hr_v in seg_hrs
+            ]
+
+            lc = LineCollection(
+                segments, colors=seg_colors, linewidths=2.0, alpha=0.95
+            )
+            hr_ax.add_collection(lc)
+
+            valid_hr_vals = y_vals[~np.isnan(y_vals)]
+            if len(valid_hr_vals) > 0:
+              hr_ax.set_xlim(
+                  float(np.nanmin(x_vals)), float(np.nanmax(x_vals))
+              )
+              hr_ax.set_ylim(
+                  valid_hr_vals.min() - 5, valid_hr_vals.max() + 5
+              )
+
+            hr_ax.set_ylabel('Heart Rate (bpm)', color='#f5ebeb')
+            hr_ax.tick_params(axis='y', colors='#f5ebeb')
+            for spine in hr_ax.spines.values():
+              spine.set_color('#451010')
+
+          legend_handles = []
+          if show_pace_line:
+            legend_handles.append(
+                Line2D([0], [0], color='#ffffff', lw=1.6, label='Pace')
+            )
+          if show_hr_line:
+            legend_handles.extend([
+                Line2D([0], [0], color='#9ca3af', lw=2.2, label='Z0/Z1'),
+                Line2D([0], [0], color='#38bdf8', lw=2.2, label='Z2'),
+                Line2D([0], [0], color='#4ade80', lw=2.2, label='Z3'),
+                Line2D([0], [0], color='#fb923c', lw=2.2, label='Z4'),
+                Line2D([0], [0], color='#ef4444', lw=2.2, label='Z5'),
+            ])
+          if legend_handles:
+            ax1.legend(
+                handles=legend_handles,
+                loc='upper center',
+                bbox_to_anchor=(0.5, 1.13),
+                ncol=len(legend_handles),
+                frameon=False,
+                labelcolor='#f5ebeb',
+                fontsize=9.5,
+            )
+
+          fig.tight_layout()
+          st.pyplot(fig)
 
       with tab2:
         st.subheader('Garmin Native Lap Splits')

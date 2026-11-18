@@ -177,7 +177,7 @@ def ensure_local_vault(db_path=DB_NAME):
 
 
 def check_password_gate():
-  """Prompts for APP_PASSWORD if configured in secrets; bypassed locally if unset."""
+  """Prompts for APP_PASSWORD if configured in secrets; supports Enter key submission."""
   app_password = _get_secret('APP_PASSWORD')
   if not app_password:
     return
@@ -186,13 +186,15 @@ def check_password_gate():
     return
 
   st.subheader('Vault Authentication')
-  entered = st.text_input('Enter access password', type='password')
-  if st.button('Unlock Dashboard'):
-    if entered == app_password:
-      st.session_state['authenticated'] = True
-      st.rerun()
-    else:
-      st.error('Invalid password.')
+  with st.form('vault_auth_form', clear_on_submit=False):
+    entered = st.text_input('Enter access password', type='password')
+    submitted = st.form_submit_button('Unlock Dashboard')
+    if submitted or entered:
+      if entered == app_password:
+        st.session_state['authenticated'] = True
+        st.rerun()
+      elif submitted:
+        st.error('Invalid password.')
   st.stop()
 
 

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import gzip
 import io
@@ -5,6 +6,7 @@ import os
 import sqlite3
 import numpy as np
 import pandas as pd
+import requests
 from fitparse import FitFile
 from cloud_vault import is_cloud_configured, push_fit_gz_to_cloud
 from hr_analytics import (
@@ -20,9 +22,31 @@ from hr_analytics import (
 
 DB_NAME = 'training_vault.db'
 
+# Fast offline bounding-box fallback for common California & Utah running hubs
+KNOWN_HUBS = [
+    (37.485, -122.236, 'Redwood City', 'California'),
+    (37.453, -122.182, 'Menlo Park', 'California'),
+    (37.442, -122.143, 'Palo Alto', 'California'),
+    (37.461, -122.198, 'Atherton', 'California'),
+    (37.429, -122.254, 'Woodside', 'California'),
+    (37.507, -122.260, 'San Carlos', 'California'),
+    (37.520, -122.276, 'Belmont', 'California'),
+    (37.563, -122.325, 'San Mateo', 'California'),
+    (37.386, -122.084, 'Mountain View', 'California'),
+    (37.368, -122.036, 'Sunnyvale', 'California'),
+    (37.338, -121.886, 'San Jose', 'California'),
+    (37.775, -122.419, 'San Francisco', 'California'),
+    (36.974, -122.031, 'Santa Cruz', 'California'),
+    (40.233, -111.658, 'Provo', 'Utah'),
+    (40.297, -111.694, 'Orem', 'Utah'),
+    (40.760, -111.891, 'Salt Lake City', 'Utah'),
+    (40.646, -111.498, 'Park City', 'Utah'),
+    (37.096, -113.568, 'St. George', 'Utah'),
+]
+
 
 def init_db(db_path=DB_NAME):
-  """Initializes all SQLite tables including compressed fit_files and gps_points."""
+  """Initializes all SQLite tables including activities, fit_files, gps_points, and location_cache."""
   init_baselines_table(db_path)
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
@@ -44,7 +68,9 @@ def init_db(db_path=DB_NAME):
             z2_min REAL,
             z3_min REAL,
             z4_min REAL,
-            z5_min REAL
+            z5_min REAL,
+            city TEXT,
+            state TEXT
         )
     ''')
   cursor.execute('''
@@ -63,6 +89,13 @@ def init_db(db_path=DB_NAME):
   cursor.execute(
       'CREATE INDEX IF NOT EXISTS idx_gps_file ON gps_points(file_name)'
   )
+  cursor.execute('''
+        CREATE TABLE IF NOT EXISTS location_cache (
+            grid_key TEXT PRIMARY KEY,
+            city TEXT,
+            state TEXT
+        )
+    ''')
 
   existing_cols = [
       row[1]
@@ -81,8 +114,128 @@ def init_db(db_path=DB_NAME):
     if col not in existing_cols:
       cursor.execute(f'ALTER TABLE activities ADD COLUMN {col} REAL')
 
+  for text_col in ['city', 'state']:
+    if text_col not in existing_cols:
+      cursor.execute(f'ALTER TABLE activities ADD COLUMN {text_col} TEXT')
+
   conn.commit()
   conn.close()
+
+
+def _offline_hub_lookup(lat, lon):
+  """Fallback nearest-city resolver if offline."""
+  best_city, best_state, best_dist = 'Outdoor Run', 'Unknown', 999.0
+  for h_lat, h_lon, c_name, s_name in KNOWN_HUBS:
+    d = ((lat - h_lat) ** 2 + (lon - h_lon) ** 2) ** 0.5
+    if d < best_dist:
+      best_dist = d
+      best_city, best_state = c_name, s_name
+  if best_dist <= 0.12:
+    return best_city, best_state
+  return 'Outdoor Run', 'Unknown'
+
+
+def resolve_lat_lon_to_city_state(lat, lon):
+  """Resolves (lat, lon) to (city, state) via BigDataCloud API with offline fallback."""
+  if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+    return 'Indoor', 'Treadmill'
+  try:
+    url = (
+        'https://api.bigdatacloud.net/data/reverse-geocode-client'
+        f'?latitude={float(lat):.4f}&longitude={float(lon):.4f}&localityLanguage=en'
+    )
+    resp = requests.get(url, timeout=4)
+    if resp.status_code == 200:
+      data = resp.json()
+      city = (
+          data.get('city')
+          or data.get('locality')
+          or data.get('principalSubdivision')
+          or 'Outdoor Run'
+      )
+      state = data.get('principalSubdivision') or data.get('countryName') or ''
+      return str(city).strip(), str(state).strip()
+  except Exception:
+    pass
+  return _offline_hub_lookup(float(lat), float(lon))
+
+
+def backfill_activity_locations(db_path=DB_NAME):
+  """Populates missing city and state values for all stored activities using cached GPS grid cells."""
+  init_db(db_path)
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+
+  missing = cursor.execute(
+      "SELECT file_name FROM activities WHERE city IS NULL OR city = ''"
+  ).fetchall()
+  if not missing:
+    conn.close()
+    return False
+
+  gps_means = dict(
+      cursor.execute(
+          'SELECT file_name, AVG(lat), AVG(lon) FROM gps_points GROUP BY file_name'
+      ).fetchall()
+  )
+   gps_lons = dict(
+      cursor.execute(
+          'SELECT file_name, AVG(lon) FROM gps_points GROUP BY file_name'
+      ).fetchall()
+  )
+  cached_grids = {
+      r[0]: (r[1], r[2])
+      for r in cursor.execute(
+          'SELECT grid_key, city, state FROM location_cache'
+      ).fetchall()
+  }
+
+  # Collect unique uncached ~1km grid cells
+  to_resolve = {}
+  file_to_grid = {}
+  for (fname,) in missing:
+    if fname in gps_means and fname in gps_lons:
+      lat = gps_means[fname]
+      lon = gps_lons[fname]
+      if lat is not None and lon is not None:
+        gkey = f'{float(lat):.2f},{float(lon):.2f}'
+        file_to_grid[fname] = gkey
+        if gkey not in cached_grids and gkey not in to_resolve:
+          to_resolve[gkey] = (float(lat), float(lon))
+
+  if to_resolve:
+    def _fetch_grid(item):
+      gkey, (lat_v, lon_v) = item
+      c_str, s_str = resolve_lat_lon_to_city_state(lat_v, lon_v)
+      return gkey, c_str, s_str
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+      for gkey, c_str, s_str in ex.map(_fetch_grid, to_resolve.items()):
+        cached_grids[gkey] = (c_str, s_str)
+        cursor.execute(
+            '''
+            INSERT INTO location_cache (grid_key, city, state)
+            VALUES (?, ?, ?)
+            ON CONFLICT(grid_key) DO UPDATE SET city = excluded.city, state = excluded.state
+            ''',
+            (gkey, c_str, s_str),
+        )
+
+  for (fname,) in missing:
+    if fname in file_to_grid:
+      c_val, s_val = cached_grids.get(
+          file_to_grid[fname], ('Outdoor Run', 'Unknown')
+      )
+    else:
+      c_val, s_val = ('Indoor', 'Treadmill')
+    cursor.execute(
+        'UPDATE activities SET city = ?, state = ? WHERE file_name = ?',
+        (c_val, s_val, fname),
+    )
+
+  conn.commit()
+  conn.close()
+  return True
 
 
 def compute_telemetry_metrics(df_records, dist_mi, total_time_sec, zones):
@@ -159,7 +312,7 @@ def compute_telemetry_metrics(df_records, dist_mi, total_time_sec, zones):
 def ingest_fit_bytes(
     file_name, raw_bytes, db_path=DB_NAME, downsample_step=3
 ):
-  """Parses raw .fit bytes and saves summary, PRs, GPS points, and compressed binary."""
+  """Parses raw .fit bytes and saves summary, location, PRs, GPS points, and compressed binary."""
   init_db(db_path)
   fitfile = FitFile(io.BytesIO(raw_bytes))
 
@@ -264,6 +417,48 @@ def ingest_fit_bytes(
   df_tiz = compute_time_in_zones(df_records, zones)
   z_mins = df_tiz['Minutes'].tolist()
 
+  # Extract downsampled GPS coordinates & resolve City/State
+  semicircle_to_deg = 180.0 / (2**31)
+  df_gps_clean = pd.DataFrame()
+  city_name, state_name = 'Indoor', 'Treadmill'
+
+  if (
+      not df_records.empty
+      and 'position_lat' in df_records.columns
+      and 'position_long' in df_records.columns
+  ):
+    df_gps = df_records[['position_lat', 'position_long']].dropna().copy()
+    if not df_gps.empty:
+      df_gps['lat'] = df_gps['position_lat'] * semicircle_to_deg
+      df_gps['lon'] = df_gps['position_long'] * semicircle_to_deg
+      df_gps_clean = df_gps[
+          df_gps['lat'].between(-89.9, 89.9)
+          & df_gps['lon'].between(-179.9, 179.9)
+      ].iloc[::downsample_step]
+
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+
+  if not df_gps_clean.empty:
+    med_lat = float(df_gps_clean['lat'].median())
+    med_lon = float(df_gps_clean['lon'].median())
+    gkey = f'{med_lat:.2f},{med_lon:.2f}'
+    cached = cursor.execute(
+        'SELECT city, state FROM location_cache WHERE grid_key = ?', (gkey,)
+    ).fetchone()
+    if cached:
+      city_name, state_name = cached[0], cached[1]
+    else:
+      city_name, state_name = resolve_lat_lon_to_city_state(med_lat, med_lon)
+      cursor.execute(
+          '''
+          INSERT INTO location_cache (grid_key, city, state)
+          VALUES (?, ?, ?)
+          ON CONFLICT(grid_key) DO UPDATE SET city = excluded.city, state = excluded.state
+          ''',
+          (gkey, city_name, state_name),
+      )
+
   summary = {
       'file_name': file_name,
       'date': str(start_time),
@@ -282,10 +477,9 @@ def ingest_fit_bytes(
       'z3_min': z_mins[2],
       'z4_min': z_mins[3],
       'z5_min': z_mins[4],
+      'city': city_name,
+      'state': state_name,
   }
-
-  conn = sqlite3.connect(db_path)
-  cursor = conn.cursor()
 
   # 1. Upsert activity summary
   cursor.execute(
@@ -294,9 +488,9 @@ def ingest_fit_bytes(
           file_name, date, distance_miles, duration_minutes, avg_pace,
           avg_heart_rate, max_heart_rate, calories, relative_effort_trimp,
           workout_tag, efficiency_factor, aerobic_decoupling,
-          z1_min, z2_min, z3_min, z4_min, z5_min
+          z1_min, z2_min, z3_min, z4_min, z5_min, city, state
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(file_name) DO UPDATE SET
           distance_miles = excluded.distance_miles,
           avg_pace = excluded.avg_pace,
@@ -308,7 +502,9 @@ def ingest_fit_bytes(
           z2_min = excluded.z2_min,
           z3_min = excluded.z3_min,
           z4_min = excluded.z4_min,
-          z5_min = excluded.z5_min
+          z5_min = excluded.z5_min,
+          city = excluded.city,
+          state = excluded.state
       ''',
       (
           summary['file_name'],
@@ -328,6 +524,8 @@ def ingest_fit_bytes(
           summary['z3_min'],
           summary['z4_min'],
           summary['z5_min'],
+          summary['city'],
+          summary['state'],
       ),
   )
 
@@ -352,25 +550,10 @@ def ingest_fit_bytes(
   has_gps = cursor.execute(
       'SELECT 1 FROM gps_points WHERE file_name = ? LIMIT 1', (file_name,)
   ).fetchone()
-  if (
-      not has_gps
-      and not df_records.empty
-      and 'position_lat' in df_records.columns
-      and 'position_long' in df_records.columns
-  ):
-    semicircle_to_deg = 180.0 / (2**31)
-    df_gps = df_records[['position_lat', 'position_long']].dropna().copy()
-    if not df_gps.empty:
-      df_gps['lat'] = df_gps['position_lat'] * semicircle_to_deg
-      df_gps['lon'] = df_gps['position_long'] * semicircle_to_deg
-      df_gps = df_gps[
-          df_gps['lat'].between(-89.9, 89.9)
-          & df_gps['lon'].between(-179.9, 179.9)
-      ].iloc[::downsample_step]
-      if not df_gps.empty:
-        df_to_save = df_gps[['lat', 'lon']].copy()
-        df_to_save.insert(0, 'file_name', file_name)
-        df_to_save.to_sql('gps_points', conn, if_exists='append', index=False)
+  if not has_gps and not df_gps_clean.empty:
+    df_to_save = df_gps_clean[['lat', 'lon']].copy()
+    df_to_save.insert(0, 'file_name', file_name)
+    df_to_save.to_sql('gps_points', conn, if_exists='append', index=False)
 
   conn.commit()
   conn.close()
@@ -395,7 +578,7 @@ def build_activity_database(folder_path='fit test files'):
         print(f'Skipped non-running file: {fname}')
         continue
       print(
-          f"Synced: {s['file_name']} | Max HR: {s['max_heart_rate']} | {s['workout_tag']}"
+          f"Synced: {s['file_name']} | {s['city']} | Max HR: {s['max_heart_rate']} | {s['workout_tag']}"
       )
     except Exception as e:
       print(f'Error processing {file_path}: {e}')
