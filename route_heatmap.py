@@ -261,14 +261,14 @@ def render_heatmap_tab():
     )
 
     layer = pdk.Layer(
-        'PathLayer',
-        data=df_paths,
-        get_path='path',
-        get_color='color',
-        width_scale=1,
-        width_min_pixels=line_width,
-        pickable=True,
-        auto_highlight=True,
+        'HeatmapLayer',
+        data=df_gps,
+        get_position='[lon, lat]',
+        colorRange=HEATMAP_COLOR_RANGE,
+        opacity=0.95,
+        radiusPixels=radius_px,
+        intensity=intensity,
+        threshold=0.005,
     )
     tooltip = {
         'html': (

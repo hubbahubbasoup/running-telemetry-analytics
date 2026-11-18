@@ -173,16 +173,15 @@ def backfill_activity_locations(db_path=DB_NAME):
     conn.close()
     return False
 
-  gps_means = dict(
-      cursor.execute(
-          'SELECT file_name, AVG(lat), AVG(lon) FROM gps_points GROUP BY file_name'
-      ).fetchall()
-  )
-   gps_lons = dict(
-      cursor.execute(
-          'SELECT file_name, AVG(lon) FROM gps_points GROUP BY file_name'
-      ).fetchall()
-  )
+  gps_rows = cursor.execute(
+      'SELECT file_name, AVG(lat), AVG(lon) FROM gps_points GROUP BY file_name'
+  ).fetchall()
+  gps_coords = {
+      r[0]: (float(r[1]), float(r[2]))
+      for r in gps_rows
+      if r[1] is not None and r[2] is not None
+  }
+
   cached_grids = {
       r[0]: (r[1], r[2])
       for r in cursor.execute(
@@ -190,18 +189,15 @@ def backfill_activity_locations(db_path=DB_NAME):
       ).fetchall()
   }
 
-  # Collect unique uncached ~1km grid cells
   to_resolve = {}
   file_to_grid = {}
   for (fname,) in missing:
-    if fname in gps_means and fname in gps_lons:
-      lat = gps_means[fname]
-      lon = gps_lons[fname]
-      if lat is not None and lon is not None:
-        gkey = f'{float(lat):.2f},{float(lon):.2f}'
-        file_to_grid[fname] = gkey
-        if gkey not in cached_grids and gkey not in to_resolve:
-          to_resolve[gkey] = (float(lat), float(lon))
+    if fname in gps_coords:
+      lat, lon = gps_coords[fname]
+      gkey = f'{lat:.2f},{lon:.2f}'
+      file_to_grid[fname] = gkey
+      if gkey not in cached_grids and gkey not in to_resolve:
+        to_resolve[gkey] = (lat, lon)
 
   if to_resolve:
     def _fetch_grid(item):
