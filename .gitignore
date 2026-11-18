@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+fit test files/
+training_vault.db
+activity_plot.png
+activity_history.csv
+*.recording.jsonl.gz
+FreeCodingWorkLog.pdf
