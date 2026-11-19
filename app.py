@@ -13,8 +13,11 @@ import streamlit as st
 from aggregate_runs import (
     backfill_activity_locations,
     build_activity_database,
+    deduplicate_vault,
+    delete_activity_from_vault,
     init_db,
     ingest_fit_bytes,
+    regeocode_all_activities,
 )
 from cloud_vault import (
     check_password_gate,
@@ -41,7 +44,7 @@ from hr_analytics import (
     set_manual_pr,
     update_athlete_baselines,
 )
-from route_heatmap import render_heatmap_tab
+from route_heatmap import render_heatmap_tab, render_single_activity_map
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -160,7 +163,6 @@ check_password_gate()
 ensure_local_vault(DB_NAME)
 init_db(DB_NAME)
 
-# Backfill city/state once if any existing runs are missing geocoded locations
 if backfill_activity_locations(DB_NAME):
   push_vault_to_cloud(DB_NAME)
 
@@ -400,7 +402,7 @@ if 'ingested_files' not in st.session_state:
 
 if uploaded_files:
   newly_added = 0
-  skipped_sport = 0
+  skipped_files = 0
   for uf in uploaded_files:
     file_sig = f'{uf.name}_{uf.size}'
     if file_sig not in st.session_state['ingested_files']:
@@ -410,12 +412,12 @@ if uploaded_files:
         if res is not None:
           newly_added += 1
         else:
-          skipped_sport += 1
+          skipped_files += 1
   if newly_added > 0:
     push_vault_to_cloud(DB_NAME)
     st.sidebar.success(f'Added {newly_added} run(s) to persistent vault.')
-  if skipped_sport > 0:
-    st.sidebar.info(f'Skipped {skipped_sport} non-running activity file(s).')
+  if skipped_files > 0:
+    st.sidebar.info(f'Skipped {skipped_files} non-running or duplicate file(s).')
 
 active_hr_max, active_hr_rest, peak_src, last_upd = get_athlete_baselines(
     DB_NAME
@@ -453,6 +455,32 @@ with st.sidebar.expander('Dynamic Athlete Baselines', expanded=False):
       push_vault_to_cloud(DB_NAME)
       st.success('Re-enabled auto-detected peak HR.')
       st.rerun()
+
+with st.sidebar.expander('Vault Maintenance', expanded=False):
+  if st.button('Remove Duplicate Runs'):
+    removed = deduplicate_vault(DB_NAME)
+    if removed:
+      push_vault_to_cloud(DB_NAME)
+      st.success(f'Removed {len(removed)} duplicate run(s): {", ".join(removed)}')
+      st.rerun()
+    else:
+      st.info('No duplicate runs found in vault.')
+
+  if st.button('Re-Geocode All Run Locations'):
+    prog_bar = st.progress(0.0, text='Resolving starting cities via OpenStreetMap...')
+
+    def _on_prog(done, total):
+      if total > 0:
+        prog_bar.progress(
+            min(1.0, done / total),
+            text=f'Resolving unique location {done} / {total}...',
+        )
+
+    n_runs, n_grids = regeocode_all_activities(DB_NAME, progress_callback=_on_prog)
+    push_vault_to_cloud(DB_NAME)
+    prog_bar.empty()
+    st.success(f'Re-geocoded {n_runs} runs across {n_grids} unique starting areas.')
+    st.rerun()
 
   if st.button('Sync Local .fit Folder to Vault'):
     with st.spinner('Ingesting local .fit files & updating vault...'):
@@ -942,12 +970,11 @@ else:
         df_saved_runs['date'].astype(str).str.slice(0, 10)
     )
 
-    # --- SEARCH, FILTER & SORT CONTROLS FOR INDIVIDUAL RUNS ---
     st.sidebar.markdown('---')
     st.sidebar.header('Search & Sort Runs')
     search_query = st.sidebar.text_input(
         'Search Date, City, State, Distance, or Pace',
-        placeholder='e.g. Provo, California, 2026-10, 5:30',
+        placeholder='e.g. Redwood City, Provo, 2026-10, 5:30',
     )
 
     with st.sidebar.expander('Filter by Location, Distance & Pace', expanded=False):
@@ -999,7 +1026,6 @@ else:
         'Order Direction', ['Descending', 'Ascending'], horizontal=True
     )
 
-    # Apply filters
     df_filtered = df_saved_runs.copy()
     if search_query.strip():
       q = search_query.strip().lower()
@@ -1050,7 +1076,6 @@ else:
       )
       city_only = row['city'] if row['city'] else 'Indoor'
       tag_val = row['workout_tag'] if row['workout_tag'] else 'Base Run'
-      # Index includes Date, Distance, City (without State/Country), and Tag
       label = f'{date_short} — {dist_val:.2f} mi — {city_only} ({tag_val})'
       if label in run_options:
         label = f"{label} [{row['file_name']}]"
@@ -1106,6 +1131,16 @@ else:
       st.sidebar.success(f'Updated tag to "{selected_workout_type}".')
       st.rerun()
 
+    with st.sidebar.expander('Delete Selected Run', expanded=False):
+      confirm_del = st.checkbox(
+          f'Confirm delete `{selected_fname}`', key=f'del_{selected_fname}'
+      )
+      if st.button('Delete Run from Vault') and confirm_del:
+        delete_activity_from_vault(selected_fname, DB_NAME)
+        push_vault_to_cloud(DB_NAME)
+        st.sidebar.success(f'Deleted `{selected_fname}` from vault.')
+        st.rerun()
+
     if not has_raw_blob:
       st.warning(
           f'Run summary for `{selected_fname}` is in the database, but its raw'
@@ -1135,11 +1170,16 @@ else:
       data = parse_fit_bytes_raw(raw_bytes)
 
       session_dist_m = None
-      if (
-          not data['session'].empty
-          and 'total_distance' in data['session'].columns
-      ):
-        session_dist_m = data['session']['total_distance'].dropna().iloc[-1]
+      session_timer_sec = None
+      if not data['session'].empty:
+        if 'total_distance' in data['session'].columns:
+          valid_sd = data['session']['total_distance'].dropna()
+          if not valid_sd.empty:
+            session_dist_m = float(valid_sd.iloc[-1])
+        if 'total_timer_time' in data['session'].columns:
+          valid_st = data['session']['total_timer_time'].dropna()
+          if not valid_st.empty:
+            session_timer_sec = float(valid_st.iloc[-1])
 
       if (
           session_dist_m
@@ -1171,7 +1211,24 @@ else:
               else 0.0
           )
       )
-      total_time_sec = df_records['dt'].sum() if not df_records.empty else 0.0
+
+      if session_timer_sec and session_timer_sec > 0:
+        active_time_sec = session_timer_sec
+      elif not df_records.empty and 'dt' in df_records.columns:
+        active_time_sec = float(df_records['dt'].clip(lower=0.0, upper=5.0).sum())
+      else:
+        active_time_sec = 0.0
+
+      if total_dist_mi > 0 and active_time_sec > 0:
+        sec_per_mi = active_time_sec / total_dist_mi
+        p_min = int(sec_per_mi // 60)
+        p_sec = int(round(sec_per_mi % 60))
+        if p_sec == 60:
+          p_min += 1
+          p_sec = 0
+        avg_pace_run = f'{p_min}:{p_sec:02d} /mi'
+      else:
+        avg_pace_run = 'N/A'
 
       avg_hr_run = (
           df_records['heart_rate'].mean()
@@ -1192,7 +1249,7 @@ else:
         if not valid_hrs.empty:
           max_hr_run = float(valid_hrs.max())
 
-      duration_min = total_time_sec / 60.0
+      duration_min = active_time_sec / 60.0
       workout_trimp = compute_banister_trimp(
           duration_min, avg_hr_run, active_hr_max, active_hr_rest
       )
@@ -1206,23 +1263,26 @@ else:
           f' **Classification:** `{selected_workout_type}`'
       )
 
-      col1, col2, col3, col4, col5, col6 = st.columns(6)
-      col1.metric('Total Distance', f'{total_dist_mi:.2f} mi')
-      col2.metric(
+      r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+      r1_c1.metric('Total Distance', f'{total_dist_mi:.2f} mi')
+      r1_c2.metric(
           'Active Moving Time',
-          f'{int(total_time_sec // 3600)}h {int((total_time_sec % 3600) // 60)}m'
-          if total_time_sec > 3600
-          else f'{int(total_time_sec // 60)}m {int(total_time_sec % 60)}s',
+          f'{int(active_time_sec // 3600)}h {int((active_time_sec % 3600) // 60)}m'
+          if active_time_sec > 3600
+          else f'{int(active_time_sec // 60)}m {int(active_time_sec % 60)}s',
       )
-      col3.metric(
+      r1_c3.metric('Average Pace', avg_pace_run)
+      r1_c4.metric(
           'Avg / Max HR',
           f'{avg_hr_run:.0f} / {max_hr_run:.0f} bpm'
           if (avg_hr_run and max_hr_run)
           else 'N/A',
       )
-      col4.metric('Relative Effort (TRIMP)', f'{workout_trimp}')
-      col5.metric('Efficiency Factor', f'{ef_score}' if ef_score else 'N/A')
-      col6.metric(
+
+      r2_c1, r2_c2, r2_c3 = st.columns(3)
+      r2_c1.metric('Relative Effort (TRIMP)', f'{workout_trimp}')
+      r2_c2.metric('Efficiency Factor', f'{ef_score}' if ef_score else 'N/A')
+      r2_c3.metric(
           'Aerobic Decoupling',
           f'{decoupling_score}%' if decoupling_score is not None else 'N/A',
           delta=(
@@ -1232,6 +1292,10 @@ else:
           ),
           delta_color='inverse',
       )
+
+      st.markdown('---')
+
+      render_single_activity_map(df_records, active_zones, file_key=selected_fname)
 
       st.markdown('---')
 
@@ -1417,6 +1481,6 @@ else:
   else:
     st.info(
         'No saved activities in the vault yet. Upload .fit files in the'
-        ' sidebar or open Dynamic Athlete Baselines and click Sync Local .fit'
+        ' sidebar or open Vault Maintenance and click Sync Local .fit'
         ' Folder to Vault.'
     )

@@ -1,9 +1,9 @@
-from concurrent.futures import ThreadPoolExecutor
 import glob
 import gzip
 import io
 import os
 import sqlite3
+import time
 import numpy as np
 import pandas as pd
 import requests
@@ -22,7 +22,6 @@ from hr_analytics import (
 
 DB_NAME = 'training_vault.db'
 
-# Fast offline bounding-box fallback for common California & Utah running hubs
 KNOWN_HUBS = [
     (37.485, -122.236, 'Redwood City', 'California'),
     (37.453, -122.182, 'Menlo Park', 'California'),
@@ -122,6 +121,13 @@ def init_db(db_path=DB_NAME):
   conn.close()
 
 
+def _grid_key(lat, lon):
+  """Rounds coordinates to a ~550m grid cell (0.005 deg) for accurate municipal caching."""
+  r_lat = round(float(lat) * 200.0) / 200.0
+  r_lon = round(float(lon) * 200.0) / 200.0
+  return f'{r_lat:.3f},{r_lon:.3f}'
+
+
 def _offline_hub_lookup(lat, lon):
   """Fallback nearest-city resolver if offline."""
   best_city, best_state, best_dist = 'Outdoor Run', 'Unknown', 999.0
@@ -135,33 +141,91 @@ def _offline_hub_lookup(lat, lon):
   return 'Outdoor Run', 'Unknown'
 
 
-def resolve_lat_lon_to_city_state(lat, lon):
-  """Resolves (lat, lon) to (city, state) via BigDataCloud API with offline fallback."""
+def resolve_lat_lon_to_city_state(lat, lon, polite_delay=0.0):
+  """Resolves (lat, lon) to exact municipality (city, state) via OpenStreetMap Nominatim,
+
+  falling back to BigDataCloud adminLevel=8 and offline hub lookup.
+  """
   if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
     return 'Indoor', 'Treadmill'
+
+  if polite_delay > 0:
+    time.sleep(polite_delay)
+
   try:
-    url = (
+    nom_url = (
+        'https://nominatim.openstreetmap.org/reverse'
+        f'?format=jsonv2&lat={float(lat):.5f}&lon={float(lon):.5f}&zoom=14&addressdetails=1'
+    )
+    headers = {
+        'User-Agent': 'RunningTelemetryAnalytics/1.0 (personal-training-vault)'
+    }
+    resp = requests.get(nom_url, headers=headers, timeout=6)
+    if resp.status_code == 200:
+      addr = resp.json().get('address', {})
+      city = (
+          addr.get('city')
+          or addr.get('town')
+          or addr.get('village')
+          or addr.get('municipality')
+          or addr.get('hamlet')
+          or addr.get('suburb')
+      )
+      state = addr.get('state') or addr.get('region') or addr.get('country') or ''
+      if city:
+        return str(city).strip(), str(state).strip()
+  except Exception:
+    pass
+
+  try:
+    bdc_url = (
         'https://api.bigdatacloud.net/data/reverse-geocode-client'
         f'?latitude={float(lat):.4f}&longitude={float(lon):.4f}&localityLanguage=en'
     )
-    resp = requests.get(url, timeout=4)
+    resp = requests.get(bdc_url, timeout=4)
     if resp.status_code == 200:
       data = resp.json()
-      city = (
-          data.get('city')
-          or data.get('locality')
-          or data.get('principalSubdivision')
-          or 'Outdoor Run'
-      )
-      state = data.get('principalSubdivision') or data.get('countryName') or ''
-      return str(city).strip(), str(state).strip()
+      if data.get('lookupSource') == 'coordinates':
+        admin_list = data.get('localityInfo', {}).get('administrative', [])
+        lvl8 = [
+            a.get('name')
+            for a in admin_list
+            if a.get('adminLevel') == 8 and a.get('name')
+        ]
+        city = (
+            (lvl8[0] if lvl8 else None)
+            or data.get('locality')
+            or data.get('city')
+            or 'Outdoor Run'
+        )
+        state = data.get('principalSubdivision') or data.get('countryName') or ''
+        return str(city).strip(), str(state).strip()
   except Exception:
     pass
+
   return _offline_hub_lookup(float(lat), float(lon))
 
 
+def _get_activity_start_coords(cursor):
+  """Returns {file_name: (start_lat, start_lon)} from the first recorded GPS point of each run."""
+  rows = cursor.execute('''
+      SELECT g.file_name, g.lat, g.lon
+      FROM gps_points g
+      INNER JOIN (
+          SELECT file_name, MIN(rowid) AS first_id
+          FROM gps_points
+          GROUP BY file_name
+      ) f ON g.file_name = f.file_name AND g.rowid = f.first_id
+  ''').fetchall()
+  return {
+      r[0]: (float(r[1]), float(r[2]))
+      for r in rows
+      if r[1] is not None and r[2] is not None
+  }
+
+
 def backfill_activity_locations(db_path=DB_NAME):
-  """Populates missing city and state values for all stored activities using cached GPS grid cells."""
+  """Populates missing city and state values for activities not yet geocoded."""
   init_db(db_path)
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
@@ -173,15 +237,7 @@ def backfill_activity_locations(db_path=DB_NAME):
     conn.close()
     return False
 
-  gps_rows = cursor.execute(
-      'SELECT file_name, AVG(lat), AVG(lon) FROM gps_points GROUP BY file_name'
-  ).fetchall()
-  gps_coords = {
-      r[0]: (float(r[1]), float(r[2]))
-      for r in gps_rows
-      if r[1] is not None and r[2] is not None
-  }
-
+  start_coords = _get_activity_start_coords(cursor)
   cached_grids = {
       r[0]: (r[1], r[2])
       for r in cursor.execute(
@@ -192,30 +248,26 @@ def backfill_activity_locations(db_path=DB_NAME):
   to_resolve = {}
   file_to_grid = {}
   for (fname,) in missing:
-    if fname in gps_coords:
-      lat, lon = gps_coords[fname]
-      gkey = f'{lat:.2f},{lon:.2f}'
+    if fname in start_coords:
+      lat, lon = start_coords[fname]
+      gkey = _grid_key(lat, lon)
       file_to_grid[fname] = gkey
       if gkey not in cached_grids and gkey not in to_resolve:
         to_resolve[gkey] = (lat, lon)
 
-  if to_resolve:
-    def _fetch_grid(item):
-      gkey, (lat_v, lon_v) = item
-      c_str, s_str = resolve_lat_lon_to_city_state(lat_v, lon_v)
-      return gkey, c_str, s_str
-
-    with ThreadPoolExecutor(max_workers=8) as ex:
-      for gkey, c_str, s_str in ex.map(_fetch_grid, to_resolve.items()):
-        cached_grids[gkey] = (c_str, s_str)
-        cursor.execute(
-            '''
-            INSERT INTO location_cache (grid_key, city, state)
-            VALUES (?, ?, ?)
-            ON CONFLICT(grid_key) DO UPDATE SET city = excluded.city, state = excluded.state
-            ''',
-            (gkey, c_str, s_str),
-        )
+  for idx, (gkey, (lat_v, lon_v)) in enumerate(to_resolve.items()):
+    c_str, s_str = resolve_lat_lon_to_city_state(
+        lat_v, lon_v, polite_delay=1.05 if idx > 0 else 0.0
+    )
+    cached_grids[gkey] = (c_str, s_str)
+    cursor.execute(
+        '''
+        INSERT INTO location_cache (grid_key, city, state)
+        VALUES (?, ?, ?)
+        ON CONFLICT(grid_key) DO UPDATE SET city = excluded.city, state = excluded.state
+        ''',
+        (gkey, c_str, s_str),
+    )
 
   for (fname,) in missing:
     if fname in file_to_grid:
@@ -232,6 +284,127 @@ def backfill_activity_locations(db_path=DB_NAME):
   conn.commit()
   conn.close()
   return True
+
+
+def regeocode_all_activities(db_path=DB_NAME, progress_callback=None):
+  """Clears stale location cache and accurately re-geocodes every run from its starting GPS point."""
+  init_db(db_path)
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+
+  cursor.execute('DELETE FROM location_cache')
+  all_files = [
+      r[0] for r in cursor.execute('SELECT file_name FROM activities').fetchall()
+  ]
+  start_coords = _get_activity_start_coords(cursor)
+
+  unique_grids = {}
+  file_to_grid = {}
+  for fname in all_files:
+    if fname in start_coords:
+      lat, lon = start_coords[fname]
+      gkey = _grid_key(lat, lon)
+      file_to_grid[fname] = gkey
+      if gkey not in unique_grids:
+        unique_grids[gkey] = (lat, lon)
+
+  resolved = {}
+  total_grids = len(unique_grids)
+  for idx, (gkey, (lat_v, lon_v)) in enumerate(unique_grids.items()):
+    if progress_callback:
+      progress_callback(idx + 1, total_grids)
+    c_str, s_str = resolve_lat_lon_to_city_state(
+        lat_v, lon_v, polite_delay=1.05 if idx > 0 else 0.0
+    )
+    resolved[gkey] = (c_str, s_str)
+    cursor.execute(
+        '''
+        INSERT INTO location_cache (grid_key, city, state)
+        VALUES (?, ?, ?)
+        ON CONFLICT(grid_key) DO UPDATE SET city = excluded.city, state = excluded.state
+        ''',
+        (gkey, c_str, s_str),
+    )
+
+  for fname in all_files:
+    if fname in file_to_grid:
+      c_val, s_val = resolved.get(
+          file_to_grid[fname], ('Outdoor Run', 'Unknown')
+      )
+    else:
+      c_val, s_val = ('Indoor', 'Treadmill')
+    cursor.execute(
+        'UPDATE activities SET city = ?, state = ? WHERE file_name = ?',
+        (c_val, s_val, fname),
+    )
+
+  conn.commit()
+  conn.close()
+  return len(all_files), total_grids
+
+
+def delete_activity_from_vault(file_name, db_path=DB_NAME):
+  """Deletes a single activity cleanly across activities, fit_files, gps_points, and best_efforts."""
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  for table in ['activities', 'fit_files', 'gps_points', 'best_efforts']:
+    cursor.execute(f'DELETE FROM {table} WHERE file_name = ?', (file_name,))
+  conn.commit()
+  conn.close()
+
+
+def deduplicate_vault(db_path=DB_NAME):
+  """Detects and removes duplicate activities with matching start timestamps and distances.
+
+  Prefers removing legacy *_ACTIVITY.fit test files when a Garmin export copy exists.
+  """
+  init_db(db_path)
+  conn = sqlite3.connect(db_path)
+  df = pd.read_sql(
+      'SELECT file_name, date, distance_miles FROM activities ORDER BY date ASC',
+      conn,
+  )
+  conn.close()
+
+  if df.empty:
+    return []
+
+  df['dt'] = pd.to_datetime(df['date'], errors='coerce')
+  df = df.dropna(subset=['dt']).sort_values('dt').reset_index(drop=True)
+
+  kept = []
+  to_delete = []
+
+  for _, row in df.iterrows():
+    fname = row['file_name']
+    dt = row['dt']
+    dist = float(row['distance_miles']) if pd.notna(row['distance_miles']) else 0.0
+
+    matched_idx = None
+    for idx, k in enumerate(kept):
+      if (
+          abs((dt - k['dt']).total_seconds()) <= 90
+          and abs(dist - k['dist']) <= 0.2
+      ):
+        matched_idx = idx
+        break
+
+    if matched_idx is None:
+      kept.append({'file_name': fname, 'dt': dt, 'dist': dist})
+    else:
+      existing = kept[matched_idx]
+      if existing['file_name'].endswith('_ACTIVITY.fit') and not fname.endswith(
+          '_ACTIVITY.fit'
+      ):
+        to_delete.append(existing['file_name'])
+        kept[matched_idx] = {'file_name': fname, 'dt': dt, 'dist': dist}
+      else:
+        to_delete.append(fname)
+
+  for dup_fname in to_delete:
+    delete_activity_from_vault(dup_fname, db_path)
+
+  return to_delete
 
 
 def compute_telemetry_metrics(df_records, dist_mi, total_time_sec, zones):
@@ -323,7 +496,6 @@ def ingest_fit_bytes(
   ]
   df_records = pd.DataFrame(records)
 
-  # 1. Skip non-running activities (e.g., swimming, cycling, strength)
   sport = str(session_data.get('sport', 'running')).lower()
   if sport != 'running':
     return None
@@ -336,7 +508,6 @@ def ingest_fit_bytes(
   ):
     total_dist_m = df_records['distance'].max()
 
-  # 2. If a treadmill run was manually calibrated, scale the record stream to match
   if (
       total_dist_m
       and not df_records.empty
@@ -357,7 +528,13 @@ def ingest_fit_bytes(
       and 'timestamp' in df_records.columns
   ):
     df_records['datetime'] = pd.to_datetime(df_records['timestamp'])
-    total_time_sec = df_records['datetime'].diff().dt.total_seconds().sum()
+    total_time_sec = (
+        df_records['datetime']
+        .diff()
+        .dt.total_seconds()
+        .clip(lower=0.0, upper=5.0)
+        .sum()
+    )
 
   start_time = session_data.get('start_time')
   if (
@@ -366,6 +543,22 @@ def ingest_fit_bytes(
       and 'timestamp' in df_records.columns
   ):
     start_time = df_records['timestamp'].min()
+
+  dist_mi = (total_dist_m / 1609.34) if total_dist_m else 0.0
+
+  if start_time is not None:
+    conn_chk = sqlite3.connect(db_path)
+    dup_row = conn_chk.execute(
+        '''
+        SELECT file_name FROM activities
+        WHERE file_name != ? AND date = ? AND ABS(distance_miles - ?) <= 0.15
+        LIMIT 1
+        ''',
+        (file_name, str(start_time), round(dist_mi, 2)),
+    ).fetchone()
+    conn_chk.close()
+    if dup_row:
+      return None
 
   avg_hr = session_data.get('avg_heart_rate')
   if (
@@ -394,7 +587,6 @@ def ingest_fit_bytes(
   efforts = extract_best_efforts_from_df(df_records)
   save_best_efforts_to_db(file_name, str(start_time), efforts, db_path)
 
-  dist_mi = (total_dist_m / 1609.34) if total_dist_m else 0.0
   duration_min = (total_time_sec / 60.0) if total_time_sec else 0.0
 
   if dist_mi > 0 and duration_min > 0:
@@ -413,7 +605,6 @@ def ingest_fit_bytes(
   df_tiz = compute_time_in_zones(df_records, zones)
   z_mins = df_tiz['Minutes'].tolist()
 
-  # Extract downsampled GPS coordinates & resolve City/State
   semicircle_to_deg = 180.0 / (2**31)
   df_gps_clean = pd.DataFrame()
   city_name, state_name = 'Indoor', 'Treadmill'
@@ -436,16 +627,16 @@ def ingest_fit_bytes(
   cursor = conn.cursor()
 
   if not df_gps_clean.empty:
-    med_lat = float(df_gps_clean['lat'].median())
-    med_lon = float(df_gps_clean['lon'].median())
-    gkey = f'{med_lat:.2f},{med_lon:.2f}'
+    start_lat = float(df_gps_clean['lat'].iloc[0])
+    start_lon = float(df_gps_clean['lon'].iloc[0])
+    gkey = _grid_key(start_lat, start_lon)
     cached = cursor.execute(
         'SELECT city, state FROM location_cache WHERE grid_key = ?', (gkey,)
     ).fetchone()
     if cached:
       city_name, state_name = cached[0], cached[1]
     else:
-      city_name, state_name = resolve_lat_lon_to_city_state(med_lat, med_lon)
+      city_name, state_name = resolve_lat_lon_to_city_state(start_lat, start_lon)
       cursor.execute(
           '''
           INSERT INTO location_cache (grid_key, city, state)
@@ -477,7 +668,6 @@ def ingest_fit_bytes(
       'state': state_name,
   }
 
-  # 1. Upsert activity summary
   cursor.execute(
       '''
       INSERT INTO activities (
@@ -525,7 +715,6 @@ def ingest_fit_bytes(
       ),
   )
 
-  # 2. Offload compressed .fit binary to Supabase object storage when configured
   compressed_blob = gzip.compress(raw_bytes)
   if is_cloud_configured():
     push_fit_gz_to_cloud(file_name, compressed_blob)
@@ -542,7 +731,6 @@ def ingest_fit_bytes(
       (file_name, stored_blob),
   )
 
-  # 3. Cache downsampled GPS coordinates if not already present
   has_gps = cursor.execute(
       'SELECT 1 FROM gps_points WHERE file_name = ? LIMIT 1', (file_name,)
   ).fetchone()
@@ -571,7 +759,7 @@ def build_activity_database(folder_path='fit test files'):
         raw_bytes = f.read()
       s = ingest_fit_bytes(fname, raw_bytes, DB_NAME)
       if s is None:
-        print(f'Skipped non-running file: {fname}')
+        print(f'Skipped non-running or duplicate file: {fname}')
         continue
       print(
           f"Synced: {s['file_name']} | {s['city']} | Max HR: {s['max_heart_rate']} | {s['workout_tag']}"
